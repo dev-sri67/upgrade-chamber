@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Callable
 
 from upgrade_chamber.runner import AttemptResult, PreparationResult
 from upgrade_chamber.storage import Store
@@ -152,14 +153,36 @@ def fake_osv(package: str, version: str) -> dict:
     }
 
 
-class FakeRunner:
-    """Programmable runner stand-in that records every call the worker makes."""
+def unavailable_osv(package: str, version: str) -> dict:
+    """Return one unavailable advisory snapshot as the OSV client would on failure."""
+    return {
+        "schema_version": 1,
+        "package": package,
+        "version": version,
+        "status": "unavailable",
+        "fetched_utc": "2026-01-01T00:00:00+00:00",
+        "error": "OSVError: OSV API unreachable",
+    }
 
-    def __init__(self, preparation: PreparationResult, attempts: list[AttemptResult]):
+
+class FakeRunner:
+    """Programmable runner stand-in that records every call the worker makes.
+
+    Optional hooks fire inside the matching runner phase label (the verifier
+    rerun also uses the "candidate" phase label) before the canned result is
+    returned, which lets a test mutate store state mid-call. Every attempt
+    call also evaluates the should_cancel callback once and records the
+    observation so tests can prove the worker passed a live check.
+    """
+
+    def __init__(self, preparation: PreparationResult, attempts: list[AttemptResult], *,
+                 hooks: dict[str, Callable[[], None]] | None = None):
         self.image = IMAGE
         self._preparation = preparation
         self._attempts = list(attempts)
+        self._hooks = dict(hooks or {})
         self.calls: list[tuple[str, float]] = []
+        self.cancel_checks: list[tuple[str, bool]] = []
 
     def run_preparation(self, *, timeout_seconds=300.0, should_cancel=None) -> PreparationResult:
         self.calls.append(("preparation", timeout_seconds))
@@ -168,6 +191,11 @@ class FakeRunner:
     def run_profile_attempt(self, input_tar: bytes, *, phase: str,
                             timeout_seconds=300.0, should_cancel=None) -> AttemptResult:
         self.calls.append((phase, timeout_seconds))
+        hook = self._hooks.get(phase)
+        if hook is not None:
+            hook()
+        observed = bool(should_cancel()) if should_cancel is not None else False
+        self.cancel_checks.append((phase, observed))
         return self._attempts.pop(0)
 
     def remove_expired_containers(self, *, now=None) -> list[str]:
@@ -372,6 +400,150 @@ class WorkerTests(unittest.TestCase):
                       sleep=sleeps.append, poll_seconds=0.25)
         idle.run_forever(should_stop_idle)
         self.assertEqual(sleeps, [0.25])
+
+    def test_cancel_during_candidate_returns_cancelled_terminal(self):
+        run_id, _ = self.store.create_run(**RUN_PARAMS)
+        run = self.store.lease_next_run("test-worker", 1000.0)
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", status="cancelled")],
+            hooks={"candidate": lambda: self.store.request_cancel(run_id)})
+        Worker(self.store, runner).execute_run(run)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "cancelled")
+        self.assertEqual(record["status_detail"], "cancelled by request")
+        self.assertIsNotNone(record["terminal_utc"])
+        self.assertEqual(
+            [attempt["phase"] for attempt in self.store.attempts(run_id)],
+            ["preparation", "baseline", "candidate"])
+        self.assertEqual([call[0] for call in runner.calls],
+                         ["preparation", "baseline", "candidate"])
+        # The cancel flag only flipped during the candidate call, so the
+        # baseline callback must have observed False and the candidate
+        # callback must have observed True through the live store check.
+        self.assertEqual(runner.cancel_checks, [("baseline", False), ("candidate", True)])
+
+    def test_job_deadline_exceeded_times_out(self):
+        run_id, _ = self.store.create_run(**RUN_PARAMS)
+        run = self.store.lease_next_run("test-worker", 1000.0)
+        runner = FakeRunner(preparation_result(), [])
+        Worker(self.store, runner, job_deadline_seconds=0.0).execute_run(run)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "timed_out")
+        self.assertEqual(record["status_detail"], "job deadline exceeded")
+        self.assertIsNotNone(record["terminal_utc"])
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(self.artifact_names(run_id), set())
+
+    def test_osv_unavailable_snapshot_is_persisted_and_run_completes(self):
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        run_id = self.execute(runner, osv_query=unavailable_osv)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "completed")
+        self.assertIsNotNone(record["terminal_utc"])
+        for name in ("advisory-baseline.json", "advisory-target.json"):
+            advisory = json.loads(self.store.get_artifact(run_id, name))
+            self.assertEqual(advisory["status"], "unavailable")
+            self.assertTrue(advisory["error"])
+        manifest = json.loads(self.store.get_artifact(run_id, "manifest.json"))
+        self.assertEqual(manifest["advisories"]["baseline"]["status"], "unavailable")
+        self.assertEqual(manifest["advisories"]["target"]["status"], "unavailable")
+        self.assertEqual(manifest["advisories"]["baseline"]["vulnerability_ids"], [])
+        self.assertEqual(manifest["advisories"]["target"]["vulnerability_ids"], [])
+
+    def test_preparation_infrastructure_failure_is_terminal(self):
+        runner = FakeRunner(
+            preparation_result("infrastructure_failed", error="Registry unreachable"), [])
+        run_id = self.execute(runner)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "infrastructure_failed")
+        self.assertIn("Registry unreachable", record["status_detail"])
+        self.assertIsNotNone(record["terminal_utc"])
+        self.assertEqual([call for call in runner.calls if call[0] != "preparation"], [])
+        self.assertEqual(self.artifact_names(run_id), {"preparation.json"})
+        events = self.store.events_after(run_id, 0)
+        self.assertFalse([event for event in events if event["kind"] == "selection"])
+
+    def test_verifier_pip_check_failure_rejects(self):
+        verifier = attempt_result("candidate", installed="2.32.2")
+        verifier.marker["steps"]["pip_check"]["exit_code"] = 1
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", installed="2.32.2"),
+             verifier])
+        run_id = self.execute(runner)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "upgrade_failed")
+        self.assertEqual(record["status_detail"], "verifier pip check failed")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline", "candidate", "verifier"])
+
+    def test_verifier_new_skips_rejects(self):
+        verifier = attempt_result("candidate", installed="2.32.2")
+        verifier.marker["counts"] = {"passed": 4, "failed": 0, "errors": 0,
+                                     "skipped": 1, "xfailed": 0, "xpassed": 0}
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", installed="2.32.2"),
+             verifier])
+        run_id = self.execute(runner)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "upgrade_failed")
+        self.assertEqual(record["status_detail"], "verifier reported new skips or xfails")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline", "candidate", "verifier"])
+
+    def test_run_forever_marks_stale_lease_and_idles(self):
+        run_id, _ = self.store.create_run(**RUN_PARAMS)
+        # The store exposes no direct lease-column write, so the lease is
+        # granted for negative seconds, which makes lease_expires_utc already
+        # expired; set_run_state then leaves the run mid-flight, non-terminal.
+        self.store.lease_next_run("lost-worker", -1.0)
+        self.store.set_run_state(run_id, "preparing")
+        runner = FakeRunner(preparation_result(), [])
+        sleeps = []
+        passes = {"count": 0}
+
+        def should_stop() -> bool:
+            passes["count"] += 1
+            return passes["count"] > 1
+
+        Worker(self.store, runner, sleep=sleeps.append, poll_seconds=0.25).run_forever(should_stop)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "infrastructure_failed")
+        self.assertEqual(record["status_detail"], "worker interrupted before completion")
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(sleeps, [0.25])
+
+    def test_events_have_increasing_ids_and_states_precede_events(self):
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        run_id = self.execute(runner)
+
+        events = self.store.events_after(run_id, 0)
+        ids = [event["id"] for event in events]
+        self.assertTrue(ids)
+        self.assertTrue(all(later > earlier for earlier, later in zip(ids, ids[1:])))
+        terminal = [event for event in events if event["kind"] == "terminal"][-1]
+        self.assertEqual(terminal["data"]["state"], "completed")
+        self.assertEqual(self.store.get_run(run_id)["state"], terminal["data"]["state"])
 
 
 if __name__ == "__main__":
