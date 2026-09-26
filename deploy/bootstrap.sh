@@ -8,6 +8,7 @@ readonly CONFIG_DIR=/etc/upgrade-chamber
 readonly SERVICE_USER=upgrade-chamber
 readonly UV_BIN=/opt/uv-0.11.8/bin/uv
 readonly EXPECTED_UV_VERSION='uv 0.11.8'
+readonly UV_VERSION_PATTERN='^uv 0[.]11[.]8( [(][^)]*[)])?$'
 readonly FINGERPRINT_FILE=.source-fingerprint
 
 if [[ $# -ne 1 ]]; then
@@ -25,7 +26,7 @@ if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 ]]; then
     echo 'Bootstrap supports Ubuntu 24.04 LTS only.' >&2
     exit 2
 fi
-if [[ ! -x $UV_BIN || $($UV_BIN --version) != "$EXPECTED_UV_VERSION" ]]; then
+if [[ ! -x $UV_BIN || ! $($UV_BIN --version) =~ $UV_VERSION_PATTERN ]]; then
     echo "Install $EXPECTED_UV_VERSION at $UV_BIN before bootstrap." >&2
     exit 2
 fi
