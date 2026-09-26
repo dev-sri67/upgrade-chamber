@@ -10,7 +10,7 @@ import struct
 import tarfile
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 
@@ -620,7 +620,10 @@ class DockerRunner:
             self._cleanup_failed = True
             raise CleanupError(f"Removal not observed for container {container.id}: {exc}") from exc
 
-    def run_probe(self, kind: str, *, timeout_seconds: float = 5.0) -> ProbeResult:
+    def run_probe(
+        self, kind: str, *, timeout_seconds: float = 5.0,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> ProbeResult:
         if self._cleanup_failed:
             raise CleanupError("Previous container removal was not observed")
         if kind not in {"infinite_loop", "success", "memory"}:
@@ -657,6 +660,14 @@ class DockerRunner:
             acknowledged = False
             poll_interval = 0.05
             while True:
+                if should_cancel is not None and should_cancel():
+                    status = "cancelled"
+                    try:
+                        container.kill()
+                    except Exception as kill_exc:
+                        detail = f"kill failed: {type(kill_exc).__name__}: {kill_exc}"
+                        error = f"{error}; {detail}" if error else detail
+                    break
                 if time.monotonic() >= deadline:
                     status = "timed_out"
                     container.kill()
@@ -729,7 +740,8 @@ class DockerRunner:
         )
 
     def run_profile_attempt(
-        self, input_tar: bytes, *, phase: str, timeout_seconds: float = 300.0
+        self, input_tar: bytes, *, phase: str, timeout_seconds: float = 300.0,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> AttemptResult:
         """Run one fixed profile phase in a fresh container and retain partial evidence."""
         if self._cleanup_failed:
@@ -766,6 +778,14 @@ class DockerRunner:
 
             poll_interval = 0.25
             while True:
+                if should_cancel is not None and should_cancel():
+                    status = "cancelled"
+                    try:
+                        container.kill()
+                    except Exception as kill_exc:
+                        detail = f"kill failed: {type(kill_exc).__name__}: {kill_exc}"
+                        error = f"{error}; {detail}" if error else detail
+                    break
                 if time.monotonic() >= deadline:
                     status = "timed_out"
                     container.kill()
@@ -849,7 +869,10 @@ class DockerRunner:
             image_identity=self.image,
         )
 
-    def run_preparation(self, *, timeout_seconds: float = 300.0) -> PreparationResult:
+    def run_preparation(
+        self, *, timeout_seconds: float = 300.0,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> PreparationResult:
         """Run the fixed, trusted downloader in a bounded networked container."""
         if self._cleanup_failed:
             raise CleanupError("Previous container removal was not observed")
@@ -880,6 +903,14 @@ class DockerRunner:
 
             poll_interval = 0.25
             while True:
+                if should_cancel is not None and should_cancel():
+                    status = "cancelled"
+                    try:
+                        container.kill()
+                    except Exception as kill_exc:
+                        detail = f"kill failed: {type(kill_exc).__name__}: {kill_exc}"
+                        error = f"{error}; {detail}" if error else detail
+                    break
                 if time.monotonic() >= deadline:
                     status = "timed_out"
                     container.kill()

@@ -510,6 +510,26 @@ class RunnerTests(unittest.TestCase):
         following = DockerRunner(IMAGE, FakeDocker(FakeContainer("success"))).run_probe("success")
         self.assertEqual(following.status, "completed")
 
+    def test_probe_cancellation_kills_and_removes(self):
+        container = FakeContainer("success")
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe(
+            "success", should_cancel=lambda: True
+        )
+        self.assertEqual(result.status, "cancelled")
+        self.assertTrue(container.killed)
+        self.assertTrue(result.removal_observed)
+        self.assertIsNone(result.error)
+
+    def test_profile_attempt_cancellation_kills_and_removes(self):
+        container = FakeAttemptContainer(attempt_marker(), {})
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_profile_attempt(
+            attempt_bundle(), phase="baseline", should_cancel=lambda: True
+        )
+        self.assertEqual(result.status, "cancelled")
+        self.assertTrue(container.killed)
+        self.assertTrue(result.removal_observed)
+        self.assertIsNone(result.error)
+
     def test_memory_probe_reports_oom_kill_with_unchanged_policy(self):
         container = FakeContainer("memory")
         docker = FakeDocker(container)
