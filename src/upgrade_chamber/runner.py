@@ -27,6 +27,8 @@ OWNER_LABEL = "upgrade-chamber.owner"
 OWNER_VALUE = "execution"
 EXEC_POLL_SECONDS = 0.05
 EXEC_CHUNK_BYTES = 64 * 1024
+EXEC_INIT_RACE_ATTEMPTS = 5
+EXEC_INIT_RACE_SLEEP_SECONDS = 0.25
 
 
 class CleanupError(RuntimeError):
@@ -216,6 +218,55 @@ def _remaining_seconds(deadline: float) -> float:
     return remaining
 
 
+def _start_exec(
+    client: Any, container_id: str, cmd: list[str], deadline: float,
+    *, stdin: bool = False, **create_kwargs: Any,
+) -> tuple[str, Any]:
+    """Create and start one exec, retrying the containerd startup race.
+
+    An exec issued immediately after container.start() can reach the daemon
+    before the containerd init process of the target container is running,
+    which docker-py reports as an APIError whose text contains
+    "FailedPrecondition" and "container init process is not running". The
+    exec_create/exec_start pair is retried up to EXEC_INIT_RACE_ATTEMPTS
+    times with a short fixed sleep between attempts, and every retry is
+    checked against the run deadline so a persistently unhealthy container
+    fails bounded instead of retrying forever. Only that precondition-shaped
+    failure is retried (matched by exception type name, without importing
+    docker, the same way NotFound is matched elsewhere); any other exception
+    propagates unchanged so genuine staging errors keep their original type
+    and message.
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        stream = None
+        try:
+            exec_id = client.api.exec_create(
+                container=container_id, cmd=list(cmd),
+                stdin=stdin, tty=False, **create_kwargs,
+            )["Id"]
+            stream = client.api.exec_start(exec_id, socket=True, tty=False)
+            return exec_id, stream
+        except Exception as exc:
+            if stream is not None:
+                stream.close()
+            text = str(exc)
+            retryable = (
+                exc.__class__.__name__ == "APIError"
+                and ("FailedPrecondition" in text or "not running" in text)
+            )
+            if not retryable:
+                raise
+            if attempts >= EXEC_INIT_RACE_ATTEMPTS:
+                raise RuntimeError(
+                    "Exec still raced the containerd init process after "
+                    f"{attempts} attempts: {exc}"
+                ) from exc
+            _remaining_seconds(deadline)
+            time.sleep(EXEC_INIT_RACE_SLEEP_SECONDS)
+
+
 def _poll_exec(client: Any, exec_id: str, deadline: float) -> int | None:
     """Wait for one exec to finish and return its exit code within the deadline."""
     while True:
@@ -290,12 +341,11 @@ class _FrameDemuxer:
 def _exec_write_file(client: Any, container_id: str, path: str, data: bytes, deadline: float) -> None:
     """Stage one file at a fixed path through an unprivileged stdin-framed exec."""
     _remaining_seconds(deadline)
-    exec_id = client.api.exec_create(
-        container=container_id,
-        cmd=["python", "-I", "-c", _WRITE_SCRIPT, path, str(len(data))],
-        stdin=True, tty=False,
-    )["Id"]
-    stream = client.api.exec_start(exec_id, socket=True, tty=False)
+    exec_id, stream = _start_exec(
+        client, container_id,
+        ["python", "-I", "-c", _WRITE_SCRIPT, path, str(len(data))],
+        deadline, stdin=True,
+    )
     try:
         sock = stream._sock
         try:
@@ -318,11 +368,11 @@ def _exec_write_file(client: Any, container_id: str, path: str, data: bytes, dea
 def _exec_extract_tar(client: Any, container_id: str, archive_path: str, deadline: float) -> None:
     """Extract the staged attempt input tar into /work through a fixed exec."""
     _remaining_seconds(deadline)
-    exec_id = client.api.exec_create(
-        container_id, ["python", "-I", "-c", _EXTRACT_SCRIPT, archive_path],
-        stdin=False, tty=False,
-    )["Id"]
-    stream = client.api.exec_start(exec_id, socket=True, tty=False)
+    exec_id, stream = _start_exec(
+        client, container_id,
+        ["python", "-I", "-c", _EXTRACT_SCRIPT, archive_path],
+        deadline,
+    )
     try:
         exit_code = _poll_exec(client, exec_id, deadline)
     finally:
@@ -334,11 +384,11 @@ def _exec_extract_tar(client: Any, container_id: str, archive_path: str, deadlin
 def _exec_read_file(client: Any, container_id: str, path: str, max_bytes: int, deadline: float) -> bytes:
     """Read one bounded export file through an exec that frames bytes on stdout."""
     _remaining_seconds(deadline)
-    exec_id = client.api.exec_create(
-        container_id, ["python", "-I", "-c", _READ_SCRIPT, path, str(max_bytes)],
-        stdout=True, stdin=False, tty=False,
-    )["Id"]
-    stream = client.api.exec_start(exec_id, socket=True, tty=False)
+    exec_id, stream = _start_exec(
+        client, container_id,
+        ["python", "-I", "-c", _READ_SCRIPT, path, str(max_bytes)],
+        deadline, stdout=True,
+    )
     collected: bytes
     try:
         collected = _FrameDemuxer(stream._sock, deadline, max_bytes).read_stdout()

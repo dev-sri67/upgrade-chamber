@@ -33,6 +33,16 @@ class NotFound(Exception):
     pass
 
 
+class APIError(Exception):
+    """Name-matched stand-in for docker-py's APIError; no docker import."""
+
+
+RACE_MESSAGE = (
+    "500 Server Error for 9eca30cba6: FailedPrecondition: "
+    "container init process is not running"
+)
+
+
 def frame(stream_type: int, payload: bytes) -> bytes:
     """Build one tty=False attach-stream frame exactly as the daemon emits it."""
     return struct.pack(">BxxxL", stream_type, len(payload)) + payload
@@ -230,6 +240,28 @@ class FakeExecAPI:
                 container.events.append(f"extract:{archive_path}")
                 record.exit_code = 0
         record.running = False
+
+
+class FlakyExecAPI(FakeExecAPI):
+    """Fake exec API whose exec_create fails like the containerd init race.
+
+    The first ``create_failures`` exec_create calls raise an APIError-named
+    exception with the given message; every later call defers to the normal
+    fake. The total number of exec_create attempts is recorded so tests can
+    assert the retry bound exactly.
+    """
+
+    def __init__(self, container: "FakeContainer", create_failures: int, message: str):
+        super().__init__(container)
+        self.create_failures = create_failures
+        self.message = message
+        self.create_calls = 0
+
+    def exec_create(self, *args, **kwargs):
+        self.create_calls += 1
+        if self.create_calls <= self.create_failures:
+            raise APIError(self.message)
+        return super().exec_create(*args, **kwargs)
 
 
 class FakeContainer:
@@ -652,6 +684,44 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(container.killed)
         self.assertTrue(result.removal_observed)
         self.assertIn("DeadlineExceeded", result.error)
+
+    def test_exec_init_race_retries_once_then_stages_successfully(self):
+        container = FakeContainer("success")
+        docker = FakeDocker(container)
+        docker.api = FlakyExecAPI(container, create_failures=1, message=RACE_MESSAGE)
+        result = DockerRunner(IMAGE, docker).run_probe("success")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.export["kind"], "success")
+        self.assertEqual(result.export["nonce"], container.nonce)
+        self.assertTrue(result.removal_observed)
+        self.assertEqual(docker.api.create_calls, 5)
+
+    def test_exec_init_race_gives_up_after_five_bounded_attempts(self):
+        container = FakeContainer("success")
+        docker = FakeDocker(container)
+        docker.api = FlakyExecAPI(container, create_failures=10**9, message=RACE_MESSAGE)
+        result = DockerRunner(IMAGE, docker).run_probe("success")
+        self.assertEqual(result.status, "infrastructure_failed")
+        self.assertIn("RuntimeError", result.error)
+        self.assertIn("FailedPrecondition", result.error)
+        self.assertIn("container init process is not running", result.error)
+        self.assertTrue(result.removal_observed)
+        self.assertEqual(docker.api.create_calls, 5)
+
+    def test_non_precondition_api_error_propagates_without_retry(self):
+        container = FakeContainer("success")
+        docker = FakeDocker(container)
+        docker.api = FlakyExecAPI(
+            container, create_failures=10**9,
+            message='500 Server Error: Internal Server Error ("daemon rejected the exec")',
+        )
+        result = DockerRunner(IMAGE, docker).run_probe("success")
+        self.assertEqual(result.status, "infrastructure_failed")
+        self.assertIn("APIError", result.error)
+        self.assertIn("daemon rejected the exec", result.error)
+        self.assertNotIn("RuntimeError", result.error)
+        self.assertTrue(result.removal_observed)
+        self.assertEqual(docker.api.create_calls, 1)
 
     def test_write_script_frames_payload_and_rejects_overwrite(self):
         with tempfile.TemporaryDirectory() as base:
