@@ -59,6 +59,23 @@ class StorageContractTests(unittest.TestCase):
         self.assertIn(db_path, calls)
         self.assertEqual(calls[db_path], 0o660)
 
+    def test_store_chmods_database_and_existing_sidecars_after_schema(self):
+        base = Path(self._context.name)
+        db_path = base / "sidecars.db"
+        with mock.patch("upgrade_chamber.storage.os.chmod") as chmod:
+            store = Store(db_path, base / "sidecars-artifacts")
+        self.addCleanup(store.close)
+        # The schema write in WAL mode creates the sidecars while the
+        # connection is still open, so all three files must exist here.
+        self.assertTrue(db_path.is_file())
+        self.assertTrue(Path(str(db_path) + "-wal").is_file())
+        self.assertTrue(Path(str(db_path) + "-shm").is_file())
+        calls = {args[0]: args[1] for args, _ in chmod.call_args_list}
+        # Tolerate Windows: only require the chmod attempt for files that exist.
+        for target in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+            if target.is_file():
+                self.assertEqual(calls.get(target), 0o660)
+
     def test_create_run_returns_token_and_stores_only_hash(self):
         run_id, token = self.create_run()
         self.assertIsInstance(run_id, int)

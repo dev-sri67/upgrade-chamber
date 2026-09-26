@@ -150,15 +150,15 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        # The schema write in WAL mode forces the -wal/-shm sidecar files to exist so the creating process can chmod its own files.
         # This heals cross-service sharing by keeping the shared files group-writable.
-        try:
-            os.chmod(db_path, 0o660)
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(str(db_path) + suffix)
-                if sidecar.exists():
-                    os.chmod(sidecar, 0o660)
-        except OSError:
-            pass
+        # Only the file's owner can chmod it; the other service sets the mode when it creates the file.
+        for target in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+            if target.exists():
+                try:
+                    os.chmod(target, 0o660)
+                except OSError:
+                    pass
 
     @staticmethod
     def _rows(cursor: sqlite3.Cursor) -> list[dict]:
