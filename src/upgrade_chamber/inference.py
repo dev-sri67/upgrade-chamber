@@ -29,6 +29,15 @@ class SmokeResult:
     outcome: str
 
 
+@dataclass(frozen=True)
+class StructuredResult:
+    ok: bool
+    content: dict | None      # parsed JSON object when ok
+    usage: dict | None        # usage of the last call
+    attempts: int             # 1 or 2
+    error: str | None         # short honest reason when not ok
+
+
 class VultrInferenceClient:
     def __init__(self, settings: Settings, client: httpx.Client | None = None):
         self._settings = settings
@@ -81,8 +90,7 @@ class VultrInferenceClient:
             raise InferenceError("Vultr model list has an unexpected format")
         return ids
 
-    def chat_completion(self, messages: list[dict[str, str]], max_tokens: int = 64) -> str:
-        model_id = self._settings.require_model_id()
+    def _validate_prompt(self, messages: list[dict[str, str]], max_tokens: int) -> None:
         if not 1 <= len(messages) <= MAX_MESSAGES or not 1 <= max_tokens <= 4096:
             raise ValueError("Inference messages and max_tokens must be bounded")
         if any(
@@ -98,6 +106,14 @@ class VultrInferenceClient:
         prompt_bytes = sum(len(message["content"].encode("utf-8")) for message in messages)
         if prompt_bytes > MAX_PROMPT_BYTES:
             raise ValueError("Inference prompt exceeds byte limit")
+
+    def chat_completion(self, messages: list[dict[str, str]], max_tokens: int = 64) -> str:
+        content, _usage = self.chat_completion_raw(messages, max_tokens)
+        return content
+
+    def chat_completion_raw(self, messages: list[dict[str, str]], max_tokens: int = 64) -> tuple[str, dict | None]:
+        self._validate_prompt(messages, max_tokens)
+        model_id = self._settings.require_model_id()
         data = self._request(
             "POST",
             "/chat/completions",
@@ -112,7 +128,41 @@ class VultrInferenceClient:
         content = first["message"].get("content")
         if not isinstance(content, str):
             raise InferenceError("Vultr completion has no text content")
-        return content
+        usage = data.get("usage")
+        return content, usage if isinstance(usage, dict) else None
+
+    @staticmethod
+    def _parse_json_object(content: str) -> dict | None:
+        try:
+            parsed = json.loads(content)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def chat_completion_structured(self, messages: list[dict[str, str]], *, max_tokens: int,
+                                    correction_prompt: str) -> StructuredResult:
+        self._validate_prompt(messages, max_tokens)
+        content, usage = self.chat_completion_raw(messages, max_tokens)
+        parsed = self._parse_json_object(content)
+        if parsed is not None:
+            return StructuredResult(ok=True, content=parsed, usage=usage, attempts=1, error=None)
+        retry_messages = [
+            *messages,
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": correction_prompt},
+        ]
+        self._validate_prompt(retry_messages, max_tokens)
+        retry_content, retry_usage = self.chat_completion_raw(retry_messages, max_tokens)
+        retry_parsed = self._parse_json_object(retry_content)
+        if retry_parsed is not None:
+            return StructuredResult(ok=True, content=retry_parsed, usage=retry_usage, attempts=2, error=None)
+        return StructuredResult(
+            ok=False,
+            content=None,
+            usage=retry_usage,
+            attempts=2,
+            error="structured response invalid after one correction retry",
+        )
 
     def smoke(self) -> SmokeResult:
         self._settings.require_inference_key()
