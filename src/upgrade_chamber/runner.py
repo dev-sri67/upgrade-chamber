@@ -185,6 +185,29 @@ os.unlink(sys.argv[1])
 sys.exit(0)
 """
 
+# _MEMORY_SCRIPT is a deliberate containment fixture, not behavior under test:
+# it allocates and zero-fills memory without bound (one 2 GiB block first, then
+# repeated 256 MiB chunks) until the 1 GiB cgroup limit OOM-kills the process.
+# The 2 GiB attempt is guarded so the chunk loop still runs when a single large
+# allocation is refused early with MemoryError instead of an OOM kill. The
+# script never exits on its own: a live run must end in an OOM kill, and a run
+# that survives to the deadline is reported as "timed_out" so the missing
+# memory bound is surfaced honestly.
+_MEMORY_SCRIPT = """\
+import time
+
+try:
+    data = bytearray(2 * 1024 * 1024 * 1024)
+except MemoryError:
+    pass
+chunks = []
+while True:
+    try:
+        chunks.append(bytearray(256 * 1024 * 1024))
+    except MemoryError:
+        time.sleep(0.01)
+"""
+
 
 def _remaining_seconds(deadline: float) -> float:
     remaining = deadline - time.monotonic()
@@ -550,7 +573,7 @@ class DockerRunner:
     def run_probe(self, kind: str, *, timeout_seconds: float = 5.0) -> ProbeResult:
         if self._cleanup_failed:
             raise CleanupError("Previous container removal was not observed")
-        if kind not in {"infinite_loop", "success"}:
+        if kind not in {"infinite_loop", "success", "memory"}:
             raise ValueError("Unsupported controller-owned probe")
         if not 0 < timeout_seconds <= MAX_PROBE_SECONDS:
             raise ValueError("Probe timeout must be greater than zero and at most 300 seconds")
@@ -568,15 +591,18 @@ class DockerRunner:
         error = None
         removed = False
         try:
-            container = self._create_container(
-                ["python", "-I", "/opt/upgrade_chamber/runner.py", kind], kind, expires_at
-            )
+            if kind == "memory":
+                command = ["python", "-I", "-c", _MEMORY_SCRIPT]
+            else:
+                command = ["python", "-I", "/opt/upgrade_chamber/runner.py", kind]
+            container = self._create_container(command, kind, expires_at)
             container.start()
-            _exec_write_file(
-                self.client, container.id, "/work/input.json",
-                json.dumps({"nonce": nonce}).encode(), deadline,
-            )
-            _exec_write_file(self.client, container.id, "/work/ready", b"", deadline)
+            if kind != "memory":
+                _exec_write_file(
+                    self.client, container.id, "/work/input.json",
+                    json.dumps({"nonce": nonce}).encode(), deadline,
+                )
+                _exec_write_file(self.client, container.id, "/work/ready", b"", deadline)
 
             acknowledged = False
             poll_interval = 0.05
@@ -589,7 +615,17 @@ class DockerRunner:
                 state = container.attrs.get("State", {})
                 if not state.get("Running", True):
                     exit_code = state.get("ExitCode")
-                    status = "completed" if exit_code == 0 and acknowledged else "infrastructure_failed"
+                    if kind == "memory":
+                        if state.get("OOMKilled"):
+                            status = "oom_killed"
+                        else:
+                            status = "infrastructure_failed"
+                            error = (
+                                "Memory probe ended without an OOM kill "
+                                f"(OOMKilled was false, exit code {exit_code})"
+                            )
+                    else:
+                        status = "completed" if exit_code == 0 and acknowledged else "infrastructure_failed"
                     break
                 if kind == "success" and not acknowledged:
                     try:

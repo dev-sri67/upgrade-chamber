@@ -17,6 +17,7 @@ from upgrade_chamber.runner import (
     CleanupError,
     DockerRunner,
     _EXTRACT_SCRIPT,
+    _MEMORY_SCRIPT,
     _READ_SCRIPT,
     _WRITE_SCRIPT,
     _FrameDemuxer,
@@ -235,12 +236,15 @@ class FakeContainer:
     def __init__(self, kind: str, *, remove_fails: bool = False, flood: bool = False,
                  hang_execs: bool = False, preset_files: dict | None = None,
                  preset_symlinks: set | None = None, split_export: set | None = None,
-                 stderr_export: set | None = None):
+                 stderr_export: set | None = None, memory_oom: bool = True,
+                 memory_exits: bool = True):
         self.id = "fake-1"
         self.kind = kind
         self.remove_fails = remove_fails
         self.flood = flood
         self.hang_execs = hang_execs
+        self.memory_oom = memory_oom
+        self.memory_exits = memory_exits
         self.labels = {}
         self.started = False
         self.killed = False
@@ -259,7 +263,12 @@ class FakeContainer:
         self.started = True
 
     def reload(self):
-        if self.kind == "success" and self.acknowledged:
+        if self.kind == "memory":
+            if self.memory_exits:
+                self.attrs = {"State": {"Running": False,
+                                        "ExitCode": 137 if self.memory_oom else 1,
+                                        "OOMKilled": self.memory_oom}}
+        elif self.kind == "success" and self.acknowledged:
             self.attrs = {"State": {"Running": False, "ExitCode": 0}}
 
     def kill(self):
@@ -468,6 +477,51 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(timed_out.removal_observed)
         following = DockerRunner(IMAGE, FakeDocker(FakeContainer("success"))).run_probe("success")
         self.assertEqual(following.status, "completed")
+
+    def test_memory_probe_reports_oom_kill_with_unchanged_policy(self):
+        container = FakeContainer("memory")
+        docker = FakeDocker(container)
+        result = DockerRunner(IMAGE, docker).run_probe("memory", timeout_seconds=1.0)
+        self.assertEqual(result.status, "oom_killed")
+        self.assertIsNone(result.error)
+        self.assertEqual(result.exit_code, 137)
+        self.assertTrue(result.removal_observed)
+        self.assertEqual(result.container_id, "fake-1")
+        self.assertIsNone(result.export)
+        self.assertFalse(container.acknowledged)
+        self.assertFalse(container.export_read_while_running)
+        self.assertFalse(docker.api.execs)
+        self.assertFalse(container.events)
+        self.assertEqual(container.files, {})
+        options = docker.containers.options
+        self.assertEqual(options["command"], ["python", "-I", "-c", _MEMORY_SCRIPT])
+        self.assertEqual(options["network_mode"], "none")
+        self.assertEqual(options["user"], "10001:10001")
+        self.assertTrue(options["read_only"])
+        self.assertFalse(options["privileged"])
+        self.assertEqual(options["cap_drop"], ["ALL"])
+        self.assertEqual(options["security_opt"], ["no-new-privileges:true"])
+        self.assertEqual(options["mem_limit"], "1g")
+        self.assertEqual(options["memswap_limit"], "1g")
+        self.assertEqual(options["nano_cpus"], 1_000_000_000)
+        self.assertEqual(options["pids_limit"], 128)
+        self.assertIn("size=536870912", options["tmpfs"]["/work"])
+
+    def test_memory_probe_without_oom_kill_is_infrastructure_failure(self):
+        container = FakeContainer("memory", memory_oom=False)
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("memory", timeout_seconds=1.0)
+        self.assertEqual(result.status, "infrastructure_failed")
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("OOMKilled was false", result.error)
+        self.assertTrue(result.removal_observed)
+
+    def test_memory_probe_deadline_times_out_kills_and_removes(self):
+        container = FakeContainer("memory", memory_exits=False)
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("memory", timeout_seconds=0.01)
+        self.assertEqual(result.status, "timed_out")
+        self.assertIsNone(result.error)
+        self.assertTrue(container.killed)
+        self.assertTrue(result.removal_observed)
 
     def test_overwrite_rejection_still_removes_container(self):
         container = FakeContainer("success", preset_files={"/work/input.json": b"stale"})

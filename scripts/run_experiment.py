@@ -1,4 +1,5 @@
-"""Run the fixed G1 sequence and retain its bounded evidence."""
+"""Run the fixed containment and upgrade sequence (timeout, memory, recovery,
+preparation, baseline, candidate) and retain its bounded evidence."""
 
 from __future__ import annotations
 
@@ -97,6 +98,14 @@ def run_experiment(image: str, output: Path, *, runner: DockerRunner | None = No
         if (timeout.status != "timed_out" or timeout.error is not None
                 or not timeout.removal_observed or not timeout.container_id):
             return stop("Timeout probe did not prove expiry and observed container removal")
+
+        current_step = "memory_probe"
+        memory = active_runner.run_probe("memory", timeout_seconds=30.0)
+        summary["steps"][current_step] = _save_result(output, current_step, memory, ())
+        _save_summary(output, summary)
+        if (memory.status != "oom_killed" or memory.error is not None
+                or not memory.removal_observed or not memory.container_id):
+            return stop("Memory probe did not demonstrate the cgroup OOM bound and observed removal")
 
         current_step = "success_probe"
         success = active_runner.run_probe("success", timeout_seconds=5.0)

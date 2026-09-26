@@ -49,11 +49,13 @@ def attempt(phase, status="passed"):
 
 class FakeRunner:
     def __init__(self, *, timeout_status="timed_out", success_status="completed",
-                 preparation_status="prepared", baseline_status="passed", candidate_status="test_failed",
+                 memory_status="oom_killed", preparation_status="prepared",
+                 baseline_status="passed", candidate_status="test_failed",
                  cleanup_error=None, timeout_error=None):
         self.calls = []
         self.timeout_status = timeout_status
         self.success_status = success_status
+        self.memory_status = memory_status
         self.preparation_status = preparation_status
         self.baseline_status = baseline_status
         self.candidate_status = candidate_status
@@ -68,8 +70,14 @@ class FakeRunner:
 
     def run_probe(self, kind, *, timeout_seconds):
         self.calls.append(kind)
-        assert timeout_seconds == 5.0
-        result = probe(kind, self.timeout_status if kind == "infinite_loop" else self.success_status)
+        assert timeout_seconds == {"infinite_loop": 5.0, "memory": 30.0, "success": 5.0}[kind]
+        if kind == "infinite_loop":
+            status = self.timeout_status
+        elif kind == "memory":
+            status = self.memory_status
+        else:
+            status = self.success_status
+        result = probe(kind, status)
         return replace(result, error=self.timeout_error) if kind == "infinite_loop" else result
 
     def run_preparation(self, *, timeout_seconds):
@@ -92,12 +100,14 @@ def test_records_all_steps_and_failed_candidate_as_result(tmp_path):
     runner = FakeRunner()
     output = tmp_path / "evidence"
     assert run_experiment(IMAGE, output, runner=runner) == 0
-    assert runner.calls == ["cleanup", "infinite_loop", "success", "preparation", "baseline", "candidate"]
+    assert runner.calls == ["cleanup", "infinite_loop", "memory", "success", "preparation", "baseline", "candidate"]
     summary = load(output)
     assert summary["status"] == "recorded"
     assert summary["image_identity"] == IMAGE
     assert summary["orphan_cleanup"] == ["expired-container"]
     assert summary["steps"]["timeout_probe"]["container_id"] == "container-infinite_loop"
+    assert summary["steps"]["memory_probe"]["status"] == "oom_killed"
+    assert summary["steps"]["memory_probe"]["container_id"] == "container-memory"
     assert summary["steps"]["candidate"]["status"] == "test_failed"
     assert summary["steps"]["candidate"]["marker"]["collected_test_ids"]
     assert summary["steps"]["baseline"]["marker"]["installed_requests_version"] == "2.31.0"
@@ -109,9 +119,12 @@ def test_records_all_steps_and_failed_candidate_as_result(tmp_path):
 @pytest.mark.parametrize(("settings", "expected_calls"), [
     ({"timeout_status": "infrastructure_failed"}, ["cleanup", "infinite_loop"]),
     ({"timeout_error": "Kill failed"}, ["cleanup", "infinite_loop"]),
-    ({"success_status": "infrastructure_failed"}, ["cleanup", "infinite_loop", "success"]),
-    ({"preparation_status": "failed"}, ["cleanup", "infinite_loop", "success", "preparation"]),
-    ({"baseline_status": "test_failed"}, ["cleanup", "infinite_loop", "success", "preparation", "baseline"]),
+    ({"memory_status": "infrastructure_failed"}, ["cleanup", "infinite_loop", "memory"]),
+    ({"success_status": "infrastructure_failed"}, ["cleanup", "infinite_loop", "memory", "success"]),
+    ({"preparation_status": "failed"},
+     ["cleanup", "infinite_loop", "memory", "success", "preparation"]),
+    ({"baseline_status": "test_failed"},
+     ["cleanup", "infinite_loop", "memory", "success", "preparation", "baseline"]),
 ])
 def test_failed_gate_records_result_and_blocks_later_steps(tmp_path, settings, expected_calls):
     runner = FakeRunner(**settings)
@@ -122,6 +135,17 @@ def test_failed_gate_records_result_and_blocks_later_steps(tmp_path, settings, e
     assert summary["status"] == "stopped"
     assert summary["error"]
     assert len(summary["steps"]) == len(expected_calls) - 1
+
+
+def test_memory_probe_failure_stops_with_oom_bound_reason(tmp_path):
+    runner = FakeRunner(memory_status="timed_out")
+    output = tmp_path / "evidence"
+    assert run_experiment(IMAGE, output, runner=runner) == 1
+    assert runner.calls == ["cleanup", "infinite_loop", "memory"]
+    summary = load(output)
+    assert summary["status"] == "stopped"
+    assert summary["steps"]["memory_probe"]["status"] == "timed_out"
+    assert summary["error"] == "Memory probe did not demonstrate the cgroup OOM bound and observed removal"
 
 
 def test_cleanup_exception_is_recorded_and_blocks_probes(tmp_path):
