@@ -1,0 +1,17 @@
+.env
+.local/
+.agents/
+.codex/
+AGENTS.md
+skills-lock.json
+.venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+artifacts/
+data/

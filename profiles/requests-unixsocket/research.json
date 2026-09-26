@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "profile_id": "requests-unixsocket-historical-0.3.0-research",
+  "status": "unvalidated",
+  "enabled": false,
+  "repository_url": "https://github.com/msabramo/requests-unixsocket",
+  "commit_sha": "8449bc0f76a2ce410644b5e8aab45829ddca54f7",
+  "historical_tag": "v0.3.0",
+  "python_version_proposed": "3.11",
+  "dependency_name": "requests",
+  "dependency_file": "requirements.txt",
+  "historical_dependency_specification": "requests>=1.1",
+  "baseline_version_proposed_reproduction_override": "2.31.0",
+  "baseline_version": null,
+  "target_selection_rule_proposed": "A stable, non-yanked Requests release at or above 2.32.2, confirmed against current PyPI and OSV metadata and available as a pre-staged offline wheel bundle",
+  "target_version": null,
+  "urllib3_version_constraint_hypothesis": "1.26.x may be needed by the historical UnixAdapter; unvalidated",
+  "fixture_package_versions": null,
+  "wheel_bundle_hashes": null,
+  "test_command_proposed_unverified": "python -m pytest requests_unixsocket/tests --junitxml=/tmp/junit.xml",
+  "historical_test_file": "requests_unixsocket/tests/test_requests_unixsocket.py",
+  "historical_test_blob_sha": "733aa879e3bf6ea9c896e5d126cf949ba797d82f",
+  "historical_test_function_count_static": 5,
+  "static_expected_test_ids_unverified": [
+    "requests_unixsocket/tests/test_requests_unixsocket.py::test_unix_domain_adapter_ok",
+    "requests_unixsocket/tests/test_requests_unixsocket.py::test_unix_domain_adapter_url_with_query_params",
+    "requests_unixsocket/tests/test_requests_unixsocket.py::test_unix_domain_adapter_connection_error",
+    "requests_unixsocket/tests/test_requests_unixsocket.py::test_unix_domain_adapter_connection_proxies_error",
+    "requests_unixsocket/tests/test_requests_unixsocket.py::test_unix_domain_adapter_monkeypatch"
+  ],
+  "collected_test_ids": null,
+  "baseline_passed": null,
+  "candidate_result": null,
+  "verification_result": null,
+  "protected_paths": [
+    "requests_unixsocket/tests/",
+    "requests_unixsocket/testutils.py",
+    "pytest.ini",
+    "tox.ini",
+    ".github/workflows/tests.yml"
+  ],
+  "research_findings": [
+    "The historical requirements file has no upper bound or baseline pin for Requests.",
+    "The annotated v0.3.0 tag dereferences to the recorded commit SHA.",
+    "The historical tests import waitress through requests_unixsocket/testutils.py and use local Unix domain sockets.",
+    "The historical UnixAdapter overrides get_connection but does not implement get_connection_with_tls_context.",
+    "Requests 2.32.2 changed the custom HTTPAdapter migration hook. An upgrade failure is plausible but has not been executed."
+  ],
+  "evidence_urls": [
+    "https://api.github.com/repos/msabramo/requests-unixsocket/git/refs/tags/v0.3.0",
+    "https://api.github.com/repos/msabramo/requests-unixsocket/git/tags/251398fe37cece21071d99528486c34586a18275",
+    "https://api.github.com/repos/msabramo/requests-unixsocket/git/trees/8449bc0f76a2ce410644b5e8aab45829ddca54f7?recursive=1",
+    "https://raw.githubusercontent.com/msabramo/requests-unixsocket/8449bc0f76a2ce410644b5e8aab45829ddca54f7/requirements.txt",
+    "https://raw.githubusercontent.com/msabramo/requests-unixsocket/8449bc0f76a2ce410644b5e8aab45829ddca54f7/test-requirements.txt",
+    "https://raw.githubusercontent.com/msabramo/requests-unixsocket/8449bc0f76a2ce410644b5e8aab45829ddca54f7/requests_unixsocket/tests/test_requests_unixsocket.py",
+    "https://raw.githubusercontent.com/msabramo/requests-unixsocket/8449bc0f76a2ce410644b5e8aab45829ddca54f7/requests_unixsocket/testutils.py",
+    "https://raw.githubusercontent.com/msabramo/requests-unixsocket/8449bc0f76a2ce410644b5e8aab45829ddca54f7/requests_unixsocket/adapters.py",
+    "https://github.com/psf/requests/blob/main/HISTORY.md",
+    "https://github.com/msabramo/requests-unixsocket/blob/master/requests_unixsocket/adapters.py"
+  ]
+}
