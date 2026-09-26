@@ -14,6 +14,8 @@ from upgrade_chamber.worker import Worker
 
 
 IMAGE = "python-runner@sha256:" + "b" * 64
+RUNNER_SOURCE_DIGEST = "c" * 64
+METADATA_SOURCE_DIGEST = "d" * 64
 BASELINE_IDS = [f"tests/test_example.py::test_{index}" for index in range(5)]
 ATTEMPT_ARTIFACT_NAMES = (
     "attempt.json",
@@ -35,7 +37,7 @@ RUN_PARAMS = {
     "idempotency_key": None,
     "submit_ip": "127.0.0.1",
     "image_identity": IMAGE,
-    "source_sha256": "c" * 64,
+    "source_sha256": RUNNER_SOURCE_DIGEST,
     "baseline_version": "2.31.0",
     "target_version": "2.32.2",
     "job_deadline_seconds": 900.0,
@@ -106,7 +108,8 @@ def attempt_result(phase: str, status: str = "passed", *, ids=None, installed=No
     )
 
 
-def preparation_result(status: str = "prepared", *, error=None) -> PreparationResult:
+def preparation_result(status: str = "prepared", *, error=None,
+                       source_digest=None) -> PreparationResult:
     """Build one PreparationResult carrying both pinned offline bundles."""
     marker = {
         "schema_version": 1,
@@ -116,8 +119,9 @@ def preparation_result(status: str = "prepared", *, error=None) -> PreparationRe
     }
     artifacts = {"preparation.json": json.dumps(marker).encode()}
     if status == "prepared":
+        metadata = {} if source_digest is None else {"source_sha256": source_digest}
         artifacts.update({
-            "baseline-metadata.json": b"{}",
+            "baseline-metadata.json": json.dumps(metadata).encode(),
             "candidate-metadata.json": b"{}",
             "baseline.tar": requirements_bundle(b"requests==2.31.0\n"),
             "candidate.tar": requirements_bundle(b"requests==2.32.2\n"),
@@ -228,7 +232,7 @@ class WorkerTests(unittest.TestCase):
             return fake_osv(package, version)
 
         runner = FakeRunner(
-            preparation_result(),
+            preparation_result(source_digest=METADATA_SOURCE_DIGEST),
             [attempt_result("baseline", installed="2.31.0"),
              attempt_result("candidate", installed="2.32.2"),
              attempt_result("candidate", installed="2.32.2")])
@@ -236,6 +240,7 @@ class WorkerTests(unittest.TestCase):
 
         run = self.store.get_run(run_id)
         self.assertEqual(run["state"], "completed")
+        self.assertEqual(run["source_sha256"], METADATA_SOURCE_DIGEST)
         self.assertIsNotNone(run["terminal_utc"])
         self.assertEqual(run["cleanup_state"], "observed")
         self.assertEqual(
@@ -269,6 +274,7 @@ class WorkerTests(unittest.TestCase):
 
         manifest = json.loads(self.store.get_artifact(run_id, "manifest.json"))
         self.assertEqual(manifest["result"]["state"], "completed")
+        self.assertEqual(manifest["source_sha256"], METADATA_SOURCE_DIGEST)
         self.assertEqual(len(manifest["attempts"]), 4)
         self.assertNotIn("manifest.json", manifest["artifacts"])
         records = {row["name"]: row for row in self.store.list_artifacts(run_id)}
@@ -306,6 +312,7 @@ class WorkerTests(unittest.TestCase):
 
         run = self.store.get_run(run_id)
         self.assertEqual(run["state"], "baseline_failed")
+        self.assertEqual(run["source_sha256"], RUNNER_SOURCE_DIGEST)
         self.assertIn("test_failed", run["status_detail"])
         self.assertIsNotNone(run["terminal_utc"])
         self.assertEqual([call[0] for call in runner.calls if call[0] != "preparation"],

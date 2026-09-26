@@ -1,29 +1,26 @@
 [Unit]
-Description=Upgrade Chamber API scaffold
+Description=Upgrade Chamber worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-User=upgrade-chamber
+User=upgrade-chamber-worker
 Group=upgrade-chamber
+SupplementaryGroups=docker
 WorkingDirectory=/opt/upgrade-chamber
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-EnvironmentFile=/etc/upgrade-chamber/api.env
-ExecStart=/opt/upgrade-chamber/.venv/bin/uvicorn upgrade_chamber.api:app --host 127.0.0.1 --port 8000
+EnvironmentFile=/etc/upgrade-chamber/worker.env
+ExecStart=/opt/upgrade-chamber/.venv/bin/python -m upgrade_chamber.worker
 Restart=on-failure
 RestartSec=3s
-# Group-writable so the API and the worker share the SQLite database and
-# artifact store through the upgrade-chamber group.
 UMask=0007
-StateDirectory=upgrade-chamber
-StateDirectoryMode=0750
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

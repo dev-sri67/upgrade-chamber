@@ -6,6 +6,7 @@ readonly APP_DIR=/opt/upgrade-chamber
 readonly STATE_DIR=/var/lib/upgrade-chamber
 readonly CONFIG_DIR=/etc/upgrade-chamber
 readonly SERVICE_USER=upgrade-chamber
+readonly WORKER_USER=upgrade-chamber-worker
 readonly UV_BIN=/opt/uv-0.11.8/bin/uv
 readonly EXPECTED_UV_VERSION='uv 0.11.8'
 readonly UV_VERSION_PATTERN='^uv 0[.]11[.]8( [(][^)]*[)])?$'
@@ -93,7 +94,16 @@ if id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx docker; then
     echo 'The API service account must not belong to the Docker group.' >&2
     exit 2
 fi
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR"
+if ! id "$WORKER_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --home-dir "$STATE_DIR" --shell /usr/sbin/nologin --gid "$SERVICE_USER" "$WORKER_USER"
+fi
+usermod -aG docker "$WORKER_USER"
+if ! id -nG "$WORKER_USER" | tr ' ' '\n' | grep -qx docker; then
+    echo 'The worker service account must belong to the Docker group.' >&2
+    exit 2
+fi
+install -d -m 0770 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR"
+install -d -m 0770 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR/artifacts"
 install -d -m 0700 -o root -g root "$CONFIG_DIR"
 if [[ -L $CONFIG_DIR/api.env ]]; then
     echo 'Environment file must not be a symlink.' >&2
@@ -104,15 +114,26 @@ if [[ ! -e $CONFIG_DIR/api.env ]]; then
 fi
 chown root:root "$CONFIG_DIR/api.env"
 chmod 0600 "$CONFIG_DIR/api.env"
+# worker.env must never contain inference credentials.
+if [[ -L $CONFIG_DIR/worker.env ]]; then
+    echo 'Environment file must not be a symlink.' >&2
+    exit 2
+fi
+if [[ ! -e $CONFIG_DIR/worker.env ]]; then
+    install -m 0640 -o root -g root /dev/null "$CONFIG_DIR/worker.env"
+fi
+chown root:root "$CONFIG_DIR/worker.env"
+chmod 0640 "$CONFIG_DIR/worker.env"
 
 export UV_PYTHON_INSTALL_DIR="$APP_DIR/.python"
 export UV_CACHE_DIR="$APP_DIR/.uv-cache"
 export UV_PROJECT_ENVIRONMENT="$APP_DIR/.venv"
 export PYTHONDONTWRITEBYTECODE=1
 (cd "$APP_DIR" && "$UV_BIN" sync --locked --no-dev --no-editable --python 3.11 --managed-python)
-"$APP_DIR/.venv/bin/python" -c 'import upgrade_chamber.api'
+"$APP_DIR/.venv/bin/python" -c 'import upgrade_chamber.api, upgrade_chamber.worker'
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 install -m 0644 -o root -g root "$script_dir/upgrade-chamber-api.service" /etc/systemd/system/upgrade-chamber-api.service
+install -m 0644 -o root -g root "$script_dir/upgrade-chamber-worker.service" /etc/systemd/system/upgrade-chamber-worker.service
 systemctl daemon-reload
-echo 'API files and service unit installed. Configure api.env and Caddy, then start services explicitly.'
+echo 'API and worker files and both service units installed. Configure api.env, worker.env, and Caddy, then start services explicitly.'

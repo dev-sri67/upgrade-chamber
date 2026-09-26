@@ -12,6 +12,7 @@ from __future__ import annotations
 import difflib
 import io
 import json
+import re
 import signal
 import tarfile
 import time
@@ -24,6 +25,7 @@ from upgrade_chamber.runner import DockerRunner
 from upgrade_chamber.storage import Store
 
 
+SOURCE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}")
 MANIFEST_NAME = "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
 PYTHON_VERSION_LABEL = "3.11"
@@ -69,6 +71,20 @@ def _result_error(result: Any) -> str:
     marker_error = result.marker.get("error") if isinstance(result.marker, dict) else None
     error = marker_error or result.error
     return error if error else "no error reported"
+
+
+def _metadata_source_digest(raw: bytes | None) -> str | None:
+    """Extract a well-formed source digest from baseline-metadata.json, or None."""
+    if raw is None:
+        return None
+    try:
+        metadata = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    digest = metadata.get("source_sha256") if isinstance(metadata, dict) else None
+    if isinstance(digest, str) and SOURCE_DIGEST_PATTERN.fullmatch(digest):
+        return digest
+    return None
 
 
 def _marker_summary(marker: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -199,6 +215,7 @@ class Worker:
         candidate_summary: dict[str, Any] | None = None
         verifier_summary: dict[str, Any] | None = None
         advisory_snapshots: dict[str, dict[str, Any]] = {}
+        source_digest = run["source_sha256"]
 
         def invoke(call: Callable[[], Any]) -> tuple[Any, str, str]:
             """Run one runner call, bracket it with timestamps, and track cleanup."""
@@ -221,7 +238,7 @@ class Worker:
                 )
                 self._save_manifest(
                     run, terminal_state, detail, cleanup_state,
-                    advisory_snapshots, baseline_summary,
+                    advisory_snapshots, baseline_summary, source_digest,
                 )
             result_payload = {
                 "state": terminal_state,
@@ -272,6 +289,14 @@ class Worker:
             return
         baseline_tar = preparation.artifacts["baseline.tar"]
         candidate_tar = preparation.artifacts["candidate.tar"]
+
+        # Record the declared source digest before the baseline phase so the
+        # manifest carries the same value the run row now holds.
+        digest = _metadata_source_digest(
+            preparation.artifacts.get("baseline-metadata.json"))
+        if digest is not None:
+            self._store.update_run(run_id, source_sha256=digest)
+            source_digest = digest
 
         stop = pre_phase_stop()
         if stop is not None:
@@ -497,6 +522,7 @@ class Worker:
     def _save_manifest(
         self, run: dict, terminal_state: str, detail: str | None, cleanup_state: str,
         advisory_snapshots: dict[str, dict[str, Any]], baseline_summary: dict[str, Any] | None,
+        source_digest: str,
     ) -> None:
         """Persist the manifest last, hashing every artifact except itself."""
         run_id = run["id"]
@@ -522,7 +548,7 @@ class Worker:
             "profile_id": run["profile_id"],
             "repository_url": run["repo_url"],
             "commit_sha": run["commit_sha"],
-            "source_sha256": run["source_sha256"],
+            "source_sha256": source_digest,
             "image_identity": self._runner.image,
             "python": PYTHON_VERSION_LABEL,
             "dependency": {
