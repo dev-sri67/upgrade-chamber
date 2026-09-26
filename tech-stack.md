@@ -88,16 +88,16 @@ Persist container IDs, job ownership labels, deadlines, and cleanup results. On 
 
 ## Agent contract
 
-The controller implements a fixed state machine. The model cannot choose tools, alter execution limits, run shell commands, or determine whether its own patch passed.
+The controller implements a fixed state machine and owns every execution limit. Repair is an agentic but strictly bounded session: the model operates a fixed, controller-defined tool set (`list_repo_files`, `read_file` for read-only file access including tests, `read_test_log`, `propose_edits`, `finish`, `abort`) and returns one structured turn per inference call through the controller. It never chooses its own tools, alters execution limits, runs shell commands, or decides whether tests passed. `propose_edits` receives static validation feedback only; the controller runs the container and feeds the real results back within the same bounded session. At most two repair executions per job are permitted, and repair acceptance comes only from fresh controller-run container verdicts.
 
 Model input contains the user request, normalized eligible package versions, relevant dependency/application files, advisory summaries, and bounded test errors. Repository instructions and logs are untrusted data, not policy. Exclude credentials and unrelated files.
 
 Expected model outputs:
 
-- Selection: `{package, target_version, rationale}` where the target belongs to the server-provided eligible list.
-- Repair: `{summary, edits: [{path, original_sha256, replacement_text}]}`.
+- Selection: a single structured call returning `{package, target_version, rationale}` where the target belongs to the server-provided eligible list.
+- Repair: a bounded tool loop that ends with `{summary, edits: [{path, original_sha256, replacement_text}]}`.
 
-Validate outputs with Pydantic; at most one format-correction retry per call. Cap each response and the total inference budget. Proposed initial budget: six calls, 60 seconds per call, and 24,000 total input/output tokens per job, adjusted only after the provider smoke test. If usage metadata is missing, enforce request-size and call-count limits regardless.
+Validate outputs with Pydantic; at most one format-correction retry per call. Cap each response and the total inference budget. Enforced budget: at most 8 model turns per repair session, at most 2 repair executions per job, at most 18 inference calls per job, and 60 seconds per call; prompts are bounded to 24 messages and 64 KiB. If usage metadata is missing, enforce request-size and call-count limits regardless.
 
 Validate edits before applying them in a disposable environment. Paths must be profile-allowed relative paths, existing file hashes must match, and protected files cannot change. Reject binary edits, symlinks, oversized changes, and modifications to tests, conftest, pytest options, build hooks, or CI. Produce the downloadable diff deterministically from original and accepted source.
 
