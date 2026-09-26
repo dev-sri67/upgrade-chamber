@@ -4,7 +4,13 @@ import httpx
 import pytest
 
 from upgrade_chamber.config import Settings
-from upgrade_chamber.inference import MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES, VultrInferenceClient, main
+from upgrade_chamber.inference import (
+    MAX_PROMPT_BYTES,
+    MAX_RESPONSE_BYTES,
+    InferenceError,
+    VultrInferenceClient,
+    main,
+)
 
 
 def test_smoke_uses_fixed_vultr_endpoint_and_records_outcome(capsys):
@@ -266,3 +272,59 @@ def test_structured_usage_absent_still_ok():
     assert result.content == {"status": "ok"}
     assert result.usage is None
     assert result.error is None
+
+
+def test_empty_completion_retries_then_succeeds():
+    seen = []
+    sleeps = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) < 3:
+            return httpx.Response(200, json={"choices": [{"message": {"content": None}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hello"}}]})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        content, _usage = VultrInferenceClient(settings, client).chat_completion_raw(
+            [{"role": "user", "content": "hi"}], sleep=sleeps.append,
+        )
+    assert content == "hello"
+    assert len(seen) == 3
+    assert sleeps == [3.0, 3.0]
+
+
+def test_empty_completion_fails_after_bounded_retries():
+    seen = []
+    sleeps = []
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        seen.append(_request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": None}}]})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises(InferenceError, match="no text content"):
+            VultrInferenceClient(settings, client).chat_completion_raw(
+                [{"role": "user", "content": "hi"}], sleep=sleeps.append,
+            )
+    assert len(seen) == 3
+    assert sleeps == [3.0, 3.0]
+
+
+def test_missing_choices_fail_immediately_without_retry():
+    seen = []
+    sleeps = []
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        seen.append(_request)
+        return httpx.Response(200, json={})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises(InferenceError, match="no choices"):
+            VultrInferenceClient(settings, client).chat_completion_raw(
+                [{"role": "user", "content": "hi"}], sleep=sleeps.append,
+            )
+    assert len(seen) == 1
+    assert sleeps == []

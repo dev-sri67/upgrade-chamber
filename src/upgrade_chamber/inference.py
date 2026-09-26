@@ -3,8 +3,9 @@
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from pydantic import ValidationError
@@ -18,6 +19,10 @@ MAX_PROMPT_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 # Agent conversations interleave many system, user, and assistant turns, so the cap is raised.
 MAX_MESSAGES = 24
+# The provider intermittently returns a completion with missing or non-string
+# content; that transient is retried a bounded number of times before failing.
+MAX_EMPTY_COMPLETION_ATTEMPTS = 3
+EMPTY_COMPLETION_BACKOFF_SECONDS = 3.0
 
 
 class InferenceError(RuntimeError):
@@ -113,25 +118,41 @@ class VultrInferenceClient:
         content, _usage = self.chat_completion_raw(messages, max_tokens)
         return content
 
-    def chat_completion_raw(self, messages: list[dict[str, str]], max_tokens: int = 64) -> tuple[str, dict | None]:
+    def chat_completion_raw(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int = 64,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> tuple[str, dict | None]:
         self._validate_prompt(messages, max_tokens)
         model_id = self._settings.require_model_id()
-        data = self._request(
-            "POST",
-            "/chat/completions",
-            payload={"model": model_id, "messages": messages, "max_tokens": max_tokens},
-        )
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise InferenceError("Vultr completion has no choices")
-        first = choices[0]
-        if not isinstance(first, dict) or not isinstance(first.get("message"), dict):
-            raise InferenceError("Vultr completion has an unexpected format")
-        content = first["message"].get("content")
-        if not isinstance(content, str):
-            raise InferenceError("Vultr completion has no text content")
-        usage = data.get("usage")
-        return content, usage if isinstance(usage, dict) else None
+        # Live runs intermittently receive an HTTP 200 completion whose message
+        # content is missing or not a string, and a probe seconds later succeeds.
+        # Retry only that observed transient condition, at most twice more after
+        # the first attempt, with a short fixed backoff. The retry stays bounded
+        # so call accounting remains honest, and every other failure raises
+        # immediately with no retry.
+        for attempt in range(1, MAX_EMPTY_COMPLETION_ATTEMPTS + 1):
+            data = self._request(
+                "POST",
+                "/chat/completions",
+                payload={"model": model_id, "messages": messages, "max_tokens": max_tokens},
+            )
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise InferenceError("Vultr completion has no choices")
+            first = choices[0]
+            if not isinstance(first, dict) or not isinstance(first.get("message"), dict):
+                raise InferenceError("Vultr completion has an unexpected format")
+            content = first["message"].get("content")
+            if not isinstance(content, str):
+                if attempt == MAX_EMPTY_COMPLETION_ATTEMPTS:
+                    raise InferenceError("Vultr completion has no text content")
+                sleep(EMPTY_COMPLETION_BACKOFF_SECONDS)
+                continue
+            usage = data.get("usage")
+            return content, usage if isinstance(usage, dict) else None
 
     @staticmethod
     def _parse_json_object(content: str) -> dict | None:
