@@ -3,10 +3,12 @@
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 
 from upgrade_chamber.runner import (
@@ -17,6 +19,7 @@ from upgrade_chamber.runner import (
     _EXTRACT_SCRIPT,
     _READ_SCRIPT,
     _WRITE_SCRIPT,
+    _FrameDemuxer,
     _validate_attempt_archive,
 )
 
@@ -27,6 +30,11 @@ LOCAL_IMAGE = "sha256:" + "b" * 64
 
 class NotFound(Exception):
     pass
+
+
+def frame(stream_type: int, payload: bytes) -> bytes:
+    """Build one tty=False attach-stream frame exactly as the daemon emits it."""
+    return struct.pack(">BxxxL", stream_type, len(payload)) + payload
 
 
 def attempt_bundle() -> bytes:
@@ -190,7 +198,13 @@ class FakeExecAPI:
         elif len(container.files[path]) > limit:
             record.exit_code = 4
         else:
-            record.chunks = [container.files[path]]
+            wire = frame(1, container.files[path])
+            if path in container.split_export:
+                record.chunks = [wire[:4], wire[4:6], wire[6:]]
+            elif path in container.stderr_export:
+                record.chunks = [frame(2, b"startup warning"), wire]
+            else:
+                record.chunks = [wire]
             record.exit_code = 0
         record.running = False
 
@@ -220,7 +234,8 @@ class FakeExecAPI:
 class FakeContainer:
     def __init__(self, kind: str, *, remove_fails: bool = False, flood: bool = False,
                  hang_execs: bool = False, preset_files: dict | None = None,
-                 preset_symlinks: set | None = None):
+                 preset_symlinks: set | None = None, split_export: set | None = None,
+                 stderr_export: set | None = None):
         self.id = "fake-1"
         self.kind = kind
         self.remove_fails = remove_fails
@@ -235,6 +250,8 @@ class FakeContainer:
         self.export_read_while_running = False
         self.files = dict(preset_files or {})
         self.symlinks = set(preset_symlinks or ())
+        self.split_export = set(split_export or ())
+        self.stderr_export = set(stderr_export or ())
         self.events: list[str] = []
         self.attrs = {"State": {"Running": True, "ExitCode": None}}
 
@@ -502,6 +519,53 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "infrastructure_failed")
         self.assertIn("not a regular file or is a symlink", result.error)
         self.assertTrue(result.removal_observed)
+
+    def test_split_frames_are_reassembled_before_validation(self):
+        container = FakeContainer("success", split_export={"/work/export/probe.json"})
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("success")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.export["kind"], "success")
+        self.assertEqual(result.export["nonce"], container.nonce)
+
+    def test_stderr_frames_are_drained_and_not_treated_as_payload(self):
+        container = FakeContainer("success", stderr_export={"/work/export/probe.json"})
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("success")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.export, {"kind": "success", "nonce": container.nonce})
+
+    def test_frame_demuxer_reassembles_bounds_and_rejects_violations(self):
+        deadline = time.monotonic() + 30
+
+        class Script:
+            def __init__(self, chunks: list[bytes]):
+                self.chunks = list(chunks)
+                self.timeouts: list[float] = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def recv(self, size):
+                return self.chunks.pop(0) if self.chunks else b""
+
+        single = _FrameDemuxer(Script([frame(1, b"hello")]), deadline, 100)
+        self.assertEqual(single.read_stdout(), b"hello")
+        multiple = _FrameDemuxer(Script([frame(1, b"ab") + frame(1, b"cd"), frame(1, b"e")]), deadline, 100)
+        self.assertEqual(multiple.read_stdout(), b"abcde")
+        partial_header = frame(1, b"payload")
+        split = _FrameDemuxer(Script([partial_header[:5], partial_header[5:]]), deadline, 100)
+        self.assertEqual(split.read_stdout(), b"payload")
+        mixed = _FrameDemuxer(Script([frame(2, b"traceback"), frame(1, b"clean")]), deadline, 100)
+        self.assertEqual(mixed.read_stdout(), b"clean")
+        bounded = _FrameDemuxer(Script([frame(1, b"x" * 250)]), deadline, 100)
+        self.assertEqual(bounded.read_stdout(), b"x" * 100)
+        guard = _FrameDemuxer(Script([frame(1, b"x" * (100 + 1024 * 1024))]), deadline, 100)
+        with self.assertRaises(RuntimeError):
+            guard.read_stdout()
+        violation = _FrameDemuxer(Script([frame(3, b"bad")]), deadline, 100)
+        with self.assertRaises(RuntimeError):
+            violation.read_stdout()
+        exhausted = _FrameDemuxer(Script([]), deadline, 100)
+        self.assertEqual(exhausted.read_stdout(), b"")
 
     def test_oversize_export_rejected_and_removed(self):
         container = FakeContainer("success", preset_files={"/work/export/probe.json": b"x" * (MAX_EXPORT_BYTES + 1)})

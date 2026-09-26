@@ -6,6 +6,7 @@ import io
 import json
 import re
 import socket
+import struct
 import tarfile
 import time
 from dataclasses import dataclass
@@ -202,9 +203,70 @@ def _poll_exec(client: Any, exec_id: str, deadline: float) -> int | None:
         time.sleep(min(EXEC_POLL_SECONDS, remaining))
 
 
+class _FrameDemuxer:
+    """Demultiplex the framed exec output stream the daemon sends for tty=False.
+
+    Every frame is an 8-byte header (one stream-type byte, three zero bytes,
+    and a four-byte big-endian payload length) followed by exactly that many
+    payload bytes; recv may split a frame anywhere, so partial headers and
+    payloads are buffered until a complete frame can be parsed. Only stdout
+    frames (type 1) are collected; stderr frames (type 2) are drained and
+    discarded, and any other stream type is a protocol violation.
+    """
+
+    HEADER_SIZE = 8
+    DRAIN_SLACK = 1024 * 1024
+
+    def __init__(self, sock: Any, deadline: float, max_bytes: int):
+        self._sock = sock
+        self._deadline = deadline
+        self._max_bytes = max_bytes
+        self._buffer = bytearray()
+        self._eof = False
+        self.output = bytearray()
+        self.drained = 0
+
+    def _recv_chunk(self) -> None:
+        """Read one bounded chunk, refreshing the timeout against the deadline."""
+        self._sock.settimeout(_remaining_seconds(self._deadline))
+        chunk = self._sock.recv(EXEC_CHUNK_BYTES)
+        if not chunk:
+            self._eof = True
+            return
+        self._buffer.extend(chunk)
+        self.drained += len(chunk)
+        if self.drained > self._max_bytes + self.DRAIN_SLACK:
+            raise RuntimeError("Exec output exceeded the framed drain guard")
+
+    def read_stdout(self) -> bytes:
+        """Collect bounded stdout payload bytes until the stream ends."""
+        guard = self._max_bytes + self.DRAIN_SLACK
+        while not self._eof:
+            if len(self._buffer) < self.HEADER_SIZE:
+                self._recv_chunk()
+                continue
+            stream_type, length = struct.unpack(">BxxxL", bytes(self._buffer[:self.HEADER_SIZE]))
+            if stream_type not in (1, 2):
+                raise RuntimeError(f"Exec output frame used unexpected stream type {stream_type}")
+            if length == 0:
+                del self._buffer[:self.HEADER_SIZE]
+                continue
+            if len(self._buffer) < self.HEADER_SIZE + length:
+                self._recv_chunk()
+                continue
+            payload = bytes(self._buffer[self.HEADER_SIZE:self.HEADER_SIZE + length])
+            del self._buffer[:self.HEADER_SIZE + length]
+            if stream_type == 1 and len(self.output) < self._max_bytes:
+                room = self._max_bytes - len(self.output)
+                self.output.extend(payload[:room])
+        if self.drained > guard:
+            raise RuntimeError("Exec output exceeded the framed drain guard")
+        return bytes(self.output)
+
+
 def _exec_write_file(client: Any, container_id: str, path: str, data: bytes, deadline: float) -> None:
     """Stage one file at a fixed path through an unprivileged stdin-framed exec."""
-    remaining = _remaining_seconds(deadline)
+    _remaining_seconds(deadline)
     exec_id = client.api.exec_create(
         container=container_id,
         cmd=["python", "-I", "-c", _WRITE_SCRIPT, path, str(len(data))],
@@ -213,10 +275,11 @@ def _exec_write_file(client: Any, container_id: str, path: str, data: bytes, dea
     stream = client.api.exec_start(exec_id, socket=True, tty=False)
     try:
         sock = stream._sock
-        sock.settimeout(remaining)
         try:
+            sock.settimeout(_remaining_seconds(deadline))
             sock.sendall(len(data).to_bytes(8, "little"))
             for offset in range(0, len(data), EXEC_CHUNK_BYTES):
+                sock.settimeout(_remaining_seconds(deadline))
                 sock.sendall(data[offset:offset + EXEC_CHUNK_BYTES])
         except socket.timeout as exc:
             raise DeadlineExceeded(f"Deadline exceeded while staging {path}") from exc
@@ -247,25 +310,18 @@ def _exec_extract_tar(client: Any, container_id: str, archive_path: str, deadlin
 
 def _exec_read_file(client: Any, container_id: str, path: str, max_bytes: int, deadline: float) -> bytes:
     """Read one bounded export file through an exec that frames bytes on stdout."""
-    remaining = _remaining_seconds(deadline)
+    _remaining_seconds(deadline)
     exec_id = client.api.exec_create(
         container_id, ["python", "-I", "-c", _READ_SCRIPT, path, str(max_bytes)],
         stdout=True, stdin=False, tty=False,
     )["Id"]
     stream = client.api.exec_start(exec_id, socket=True, tty=False)
-    collected = bytearray()
+    collected: bytes
     try:
-        sock = stream._sock
-        sock.settimeout(remaining)
-        try:
-            while len(collected) <= max_bytes:
-                chunk = sock.recv(EXEC_CHUNK_BYTES)
-                if not chunk:
-                    break
-                collected.extend(chunk)
-        except socket.timeout as exc:
-            raise DeadlineExceeded(f"Deadline exceeded while reading {path}") from exc
+        collected = _FrameDemuxer(stream._sock, deadline, max_bytes).read_stdout()
         exit_code = _poll_exec(client, exec_id, deadline)
+    except socket.timeout as exc:
+        raise DeadlineExceeded(f"Deadline exceeded while reading {path}") from exc
     finally:
         stream.close()
     if exit_code == 3:
