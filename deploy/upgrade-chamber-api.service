@@ -14,11 +14,11 @@ EnvironmentFile=/etc/upgrade-chamber/api.env
 ExecStart=/opt/upgrade-chamber/.venv/bin/uvicorn upgrade_chamber.api:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=3s
-# Group-writable so the API and the worker share the SQLite database and
-# artifact store through the upgrade-chamber group.
+# Group-writable so the worker service shares this state directory and its
+# SQLite database through the upgrade-chamber group.
 UMask=0007
 StateDirectory=upgrade-chamber
-StateDirectoryMode=0750
+StateDirectoryMode=0770
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

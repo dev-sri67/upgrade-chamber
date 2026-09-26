@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -149,6 +150,15 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        # This heals cross-service sharing by keeping the shared files group-writable.
+        try:
+            os.chmod(db_path, 0o660)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(db_path) + suffix)
+                if sidecar.exists():
+                    os.chmod(sidecar, 0o660)
+        except OSError:
+            pass
 
     @staticmethod
     def _rows(cursor: sqlite3.Cursor) -> list[dict]:

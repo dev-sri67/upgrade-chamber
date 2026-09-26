@@ -8,6 +8,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from upgrade_chamber.storage import Store
 
@@ -47,6 +48,16 @@ class StorageContractTests(unittest.TestCase):
 
     def create_run(self, **overrides) -> tuple[int, str]:
         return self.store.create_run(**run_params(**overrides))
+
+    def test_store_chmods_database_group_writable(self):
+        base = Path(self._context.name)
+        db_path = base / "shared.db"
+        with mock.patch("upgrade_chamber.storage.os.chmod") as chmod:
+            store = Store(db_path, base / "shared-artifacts")
+        self.addCleanup(store.close)
+        calls = {args[0]: args[1] for args, _ in chmod.call_args_list}
+        self.assertIn(db_path, calls)
+        self.assertEqual(calls[db_path], 0o660)
 
     def test_create_run_returns_token_and_stores_only_hash(self):
         run_id, token = self.create_run()
