@@ -71,7 +71,7 @@ MAX_REPAIRS = 2
 MAX_INFERENCE_CALLS = 18
 INTERNAL_RESPONSE_LIMIT = 1024 * 1024
 INFERENCE_ERROR_MESSAGE_LIMIT = 500
-INFERENCE_TIMEOUT_SECONDS = 240.0  # must exceed the API-side inference call duration so the API response is never cut off client-side
+INFERENCE_TIMEOUT_SECONDS = 360.0  # must exceed the API-side inference call duration so the API response is never cut off client-side
 RECORD_LIMIT = 2000
 TURN_DETAIL_LIMIT = 300
 
@@ -233,7 +233,7 @@ class Worker:
         """POST one JSON payload to an internal inference endpoint.
 
         Uses the injected HTTP client or builds a default httpx client with a
-        240 second timeout, no environment proxies, and no redirects. Sends
+        360 second timeout, no environment proxies, and no redirects. Sends
         X-Internal-Token when configured. Non-2xx responses, oversized
         bodies, and malformed payloads become InternalInferenceError carrying
         the error body's code and message, never a raw response.
@@ -275,7 +275,7 @@ class Worker:
     def _agent_model_call(self, run_id: int, messages: list[dict[str, str]]) -> dict[str, Any]:
         """POST one agent conversation turn to the internal inference endpoint.
 
-        Sends the full worker-owned conversation with the fixed 16384 token
+        Sends the full worker-owned conversation with the fixed 32768 token
         cap and returns the trimmed {"message", "usage"} pair the agent
         session consumes. The latest response model_id is recorded on
         ``self._agent_model_id`` so run evidence can name the model.
@@ -283,7 +283,7 @@ class Worker:
         response = self._internal_post("/internal/inference/agent-turn", {
             "run_id": run_id,
             "messages": messages,
-            "max_tokens": 16384,
+            "max_tokens": 32768,
         })
         self._agent_model_id = response.get("model_id")
         return {"message": response["message"], "usage": response["usage"]}

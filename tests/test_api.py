@@ -529,7 +529,7 @@ class InternalInferenceTests(unittest.TestCase):
         })
         self.assertEqual(len(stub.calls), 1)
         self.assertEqual(stub.calls[0]["max_tokens"], 2048)
-        self.assertEqual(stub.calls[0]["timeout"], 180.0)
+        self.assertEqual(stub.calls[0]["timeout"], 300.0)
         self.assertEqual(stub.calls[0]["messages"], body["messages"])
         self.assertEqual(
             stub.calls[0]["correction_prompt"],
@@ -597,9 +597,9 @@ class InternalInferenceTests(unittest.TestCase):
         client, _ = self.make_client(stub)
         stub.result = agent_turn_result()
         response = client.post(
-            "/internal/inference/agent-turn", json=agent_turn_body(max_tokens=9000))
+            "/internal/inference/agent-turn", json=agent_turn_body(max_tokens=32768))
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(stub.calls[0]["max_tokens"], 9000)
+        self.assertEqual(stub.calls[0]["max_tokens"], 32768)
 
     def test_agent_turn_body_shape_and_caps_rejected(self):
         stub = StubInference()
@@ -607,7 +607,7 @@ class InternalInferenceTests(unittest.TestCase):
         for body in (
             agent_turn_body(messages=[]),
             agent_turn_body(max_tokens=0),
-            agent_turn_body(max_tokens=17000),
+            agent_turn_body(max_tokens=32769),
             agent_turn_body(messages=[{"role": "tool", "content": "not allowed"}]),
             {**agent_turn_body(), "unexpected": True},
         ):

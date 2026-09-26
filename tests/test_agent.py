@@ -71,6 +71,17 @@ WRONG_HASH_EDIT = dict(VALID_EDIT, original_sha256="0" * 64)
 
 
 class AgentSessionTest(unittest.TestCase):
+    def test_opening_system_message_demands_brief_reasoning(self):
+        session, captured = make_session([turn_response("abort", {"reason": "stop"})])
+        session.run()
+        system_content = captured[0][0]["content"]
+        self.assertEqual(captured[0][0]["role"], "system")
+        self.assertIn("Reason briefly", system_content)
+        self.assertIn(
+            "the first turn should usually be list_repo_files or read_file",
+            system_content,
+        )
+
     def test_happy_repair_finishes_with_validated_edits(self):
         responses = [
             turn_response("list_repo_files", {}),

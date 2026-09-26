@@ -104,7 +104,7 @@ class VultrInferenceClient:
 
     def _validate_prompt(self, messages: list[dict[str, str]], max_tokens: int) -> None:
         # Hidden reasoning tokens count against max_tokens on this provider, so repair turns need a large headroom.
-        if not 1 <= len(messages) <= MAX_MESSAGES or not 1 <= max_tokens <= 16384:
+        if not 1 <= len(messages) <= MAX_MESSAGES or not 1 <= max_tokens <= 32768:
             raise ValueError("Inference messages and max_tokens must be bounded")
         if any(
             not isinstance(message, dict)

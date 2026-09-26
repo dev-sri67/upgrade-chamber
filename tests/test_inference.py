@@ -101,10 +101,10 @@ def test_max_tokens_budget_covers_hidden_reasoning_headroom():
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         inference = VultrInferenceClient(settings, client)
         assert inference.chat_completion(
-            [{"role": "user", "content": "hello"}], max_tokens=16384) == "ok"
+            [{"role": "user", "content": "hello"}], max_tokens=32768) == "ok"
         with pytest.raises(ValueError, match="bounded"):
             inference.chat_completion(
-                [{"role": "user", "content": "hello"}], max_tokens=16385)
+                [{"role": "user", "content": "hello"}], max_tokens=32769)
 
 
 def test_redirect_is_rejected_even_when_injected_client_follows_redirects(capsys):

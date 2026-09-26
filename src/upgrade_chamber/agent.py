@@ -33,6 +33,8 @@ _COMPACTION_NOTE = (
     "the message bound; earlier tool results are no longer visible here."
 )
 
+# Live probing showed unbounded reasoning starves the completion budget, so the
+# session asks the model for short reasoning and immediate tool use.
 _SYSTEM_PROMPT = (
     "You are a compatibility repair agent working inside a controlled "
     "upgrade pipeline. You interact only through a fixed tool set executed "
@@ -49,7 +51,9 @@ _SYSTEM_PROMPT = (
     "replacement_text, where path comes from the controller-provided "
     "editable allow-list and original_sha256 matches the current content. "
     "Never claim tests passed; only the controller executes tests and "
-    "decides outcomes."
+    "decides outcomes. "
+    "Reason briefly. Call exactly one tool per turn. Do not overthink; the "
+    "first turn should usually be list_repo_files or read_file."
 )
 
 
