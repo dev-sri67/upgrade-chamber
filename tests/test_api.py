@@ -66,12 +66,13 @@ class StubInference:
         self.result = None
         self.calls = []
 
-    def chat_completion_structured(self, messages, *, max_tokens, correction_prompt):
+    def chat_completion_structured(self, messages, *, max_tokens, correction_prompt, timeout=None):
         self.calls.append(
             {
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "correction_prompt": correction_prompt,
+                "timeout": timeout,
             }
         )
         if isinstance(self.result, Exception):
@@ -457,6 +458,7 @@ class InternalInferenceTests(unittest.TestCase):
         })
         self.assertEqual(len(stub.calls), 1)
         self.assertEqual(stub.calls[0]["max_tokens"], 4096)
+        self.assertIsNone(stub.calls[0]["timeout"])
         self.assertEqual(stub.calls[0]["messages"][0]["role"], "system")
         self.assertEqual(
             stub.calls[0]["messages"][0]["content"],
@@ -527,6 +529,7 @@ class InternalInferenceTests(unittest.TestCase):
         })
         self.assertEqual(len(stub.calls), 1)
         self.assertEqual(stub.calls[0]["max_tokens"], 2048)
+        self.assertEqual(stub.calls[0]["timeout"], 180.0)
         self.assertEqual(stub.calls[0]["messages"], body["messages"])
         self.assertEqual(
             stub.calls[0]["correction_prompt"],

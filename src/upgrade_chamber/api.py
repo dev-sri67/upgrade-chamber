@@ -432,13 +432,14 @@ def _register_routes(application: FastAPI, runtime: Callable[[], tuple[Settings,
         *,
         max_tokens: int,
         correction_prompt: str = _STRUCTURED_CORRECTION_PROMPT,
+        timeout: float | None = None,
     ) -> StructuredResult:
         """Run one structured inference call and close the client when it owns one."""
         factory = getattr(application.state, "inference_factory", None) or _default_inference_factory
         client = factory(settings)
         try:
             return client.chat_completion_structured(
-                messages, max_tokens=max_tokens, correction_prompt=correction_prompt)
+                messages, max_tokens=max_tokens, correction_prompt=correction_prompt, timeout=timeout)
         finally:
             closer = getattr(client, "close", None)
             if callable(closer):
@@ -497,6 +498,7 @@ def _register_routes(application: FastAPI, runtime: Callable[[], tuple[Settings,
                 messages,
                 max_tokens=request.max_tokens,
                 correction_prompt=_AGENT_TURN_CORRECTION_PROMPT,
+                timeout=180.0,
             )
         except (InferenceError, ValueError) as exc:
             raise ApiError(502, "inference_unavailable", str(exc)[:500]) from None

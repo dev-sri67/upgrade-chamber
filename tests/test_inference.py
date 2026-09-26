@@ -342,3 +342,59 @@ def test_missing_choices_fail_immediately_without_retry():
             )
     assert len(seen) == 1
     assert sleeps == []
+
+
+class _FakeStreamResponse:
+    status_code = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def iter_bytes(self):
+        yield json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+
+class FakeStreamClient:
+    """Minimal client double recording every stream() call's kwargs."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return _FakeStreamResponse()
+
+
+def test_chat_completion_raw_forwards_per_call_timeout():
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    extended = FakeStreamClient()
+    assert VultrInferenceClient(settings, extended).chat_completion_raw(
+        [{"role": "user", "content": "hi"}], max_tokens=64, timeout=180.0,
+    ) == ("ok", None)
+    assert extended.calls[0]["method"] == "POST"
+    assert extended.calls[0]["timeout"] == 180.0
+
+    default = FakeStreamClient()
+    assert VultrInferenceClient(settings, default).chat_completion_raw(
+        [{"role": "user", "content": "hi"}], max_tokens=64,
+    ) == ("ok", None)
+    assert "timeout" not in default.calls[0]
+
+
+def test_chat_completion_structured_forwards_timeout_to_both_attempts():
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    client = FakeStreamClient()
+    result = VultrInferenceClient(settings, client).chat_completion_structured(
+        [{"role": "user", "content": "give json"}],
+        max_tokens=64,
+        correction_prompt="fix it",
+        timeout=180.0,
+    )
+    assert result.ok is False
+    assert result.attempts == 2
+    assert len(client.calls) == 2
+    assert client.calls[0]["timeout"] == 180.0
+    assert client.calls[1]["timeout"] == 180.0

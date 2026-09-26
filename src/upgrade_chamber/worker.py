@@ -71,7 +71,7 @@ MAX_REPAIRS = 2
 MAX_INFERENCE_CALLS = 18
 INTERNAL_RESPONSE_LIMIT = 1024 * 1024
 INFERENCE_ERROR_MESSAGE_LIMIT = 500
-INFERENCE_TIMEOUT_SECONDS = 60.0
+INFERENCE_TIMEOUT_SECONDS = 240.0  # must exceed the API-side inference call duration so the API response is never cut off client-side
 RECORD_LIMIT = 2000
 TURN_DETAIL_LIMIT = 300
 
@@ -233,7 +233,7 @@ class Worker:
         """POST one JSON payload to an internal inference endpoint.
 
         Uses the injected HTTP client or builds a default httpx client with a
-        60 second timeout, no environment proxies, and no redirects. Sends
+        240 second timeout, no environment proxies, and no redirects. Sends
         X-Internal-Token when configured. Non-2xx responses, oversized
         bodies, and malformed payloads become InternalInferenceError carrying
         the error body's code and message, never a raw response.

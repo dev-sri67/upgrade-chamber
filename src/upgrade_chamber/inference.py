@@ -58,8 +58,12 @@ class VultrInferenceClient:
         if self._owns_client:
             self._client.close()
 
-    def _request(self, method: str, path: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self, method: str, path: str, *, payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         key = self._settings.require_inference_key().get_secret_value()
+        # Repair turns may reason for minutes under the raised token budget, so the caller can extend the per-call HTTP timeout while global bounds stay fixed.
         try:
             with self._client.stream(
                 method,
@@ -67,6 +71,7 @@ class VultrInferenceClient:
                 headers={"Authorization": f"Bearer {key}"},
                 json=payload,
                 follow_redirects=False,
+                **({"timeout": timeout} if timeout is not None else {}),
             ) as response:
                 if not 200 <= response.status_code < 300:
                     raise InferenceError(f"Vultr inference returned HTTP {response.status_code}")
@@ -124,6 +129,7 @@ class VultrInferenceClient:
         messages: list[dict[str, str]],
         max_tokens: int = 64,
         *,
+        timeout: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> tuple[str, dict | None]:
         self._validate_prompt(messages, max_tokens)
@@ -139,6 +145,7 @@ class VultrInferenceClient:
                 "POST",
                 "/chat/completions",
                 payload={"model": model_id, "messages": messages, "max_tokens": max_tokens},
+                timeout=timeout,
             )
             choices = data.get("choices")
             if not isinstance(choices, list) or not choices:
@@ -163,10 +170,12 @@ class VultrInferenceClient:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def chat_completion_structured(self, messages: list[dict[str, str]], *, max_tokens: int,
-                                    correction_prompt: str) -> StructuredResult:
+    def chat_completion_structured(
+        self, messages: list[dict[str, str]], *, max_tokens: int,
+        correction_prompt: str, timeout: float | None = None,
+    ) -> StructuredResult:
         self._validate_prompt(messages, max_tokens)
-        content, usage = self.chat_completion_raw(messages, max_tokens)
+        content, usage = self.chat_completion_raw(messages, max_tokens, timeout=timeout)
         parsed = self._parse_json_object(content)
         if parsed is not None:
             return StructuredResult(ok=True, content=parsed, usage=usage, attempts=1, error=None)
@@ -176,7 +185,7 @@ class VultrInferenceClient:
             {"role": "user", "content": correction_prompt},
         ]
         self._validate_prompt(retry_messages, max_tokens)
-        retry_content, retry_usage = self.chat_completion_raw(retry_messages, max_tokens)
+        retry_content, retry_usage = self.chat_completion_raw(retry_messages, max_tokens, timeout=timeout)
         retry_parsed = self._parse_json_object(retry_content)
         if retry_parsed is not None:
             return StructuredResult(ok=True, content=retry_parsed, usage=retry_usage, attempts=2, error=None)
