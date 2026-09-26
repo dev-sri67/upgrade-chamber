@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import socket
 import tarfile
 import time
 from dataclasses import dataclass
@@ -23,10 +24,20 @@ MAX_SMALL_INPUT_BYTES = 64 * 1024
 MAX_INPUT_FILES = 256
 OWNER_LABEL = "upgrade-chamber.owner"
 OWNER_VALUE = "execution"
+EXEC_POLL_SECONDS = 0.05
+EXEC_CHUNK_BYTES = 64 * 1024
 
 
 class CleanupError(RuntimeError):
     """Container removal could not be observed; new jobs must be blocked."""
+
+
+class DeadlineExceeded(RuntimeError):
+    """A bounded exec or socket operation outlived the run deadline."""
+
+
+class ArtifactMissing(RuntimeError):
+    """A polled export path does not exist in the container yet."""
 
 
 @dataclass(frozen=True)
@@ -85,16 +96,187 @@ class PreparationResult:
     image_identity: str
 
 
-def _archive_file(name: str, data: bytes) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
-        info = tarfile.TarInfo(name)
-        info.mode = 0o600
-        info.uid = 10001
-        info.gid = 10001
-        info.size = len(data)
-        archive.addfile(info, io.BytesIO(data))
-    return buffer.getvalue()
+# The container root filesystem is read-only and its tmpfs paths are unreachable
+# through Docker's archive API, so the controller stages inputs and exports
+# artifacts with fixed, unprivileged Python execs instead. The scripts below are
+# module constants so the argv contract stays auditable and the test fakes can
+# interpret it exactly.
+
+# _WRITE_SCRIPT frames one file on stdin: an 8-byte little-endian unsigned
+# length prefix followed by exactly that many bytes. The frame length is
+# validated against the cap passed as the second argv value. The target is
+# opened with O_EXCL so an existing file or symlink is rejected rather than
+# overwritten or followed, and the bytes are flushed and fsynced before exit 0.
+_WRITE_SCRIPT = """\
+import os
+import sys
+
+path, cap = sys.argv[1], int(sys.argv[2])
+prefix = bytearray()
+while len(prefix) < 8:
+    chunk = sys.stdin.buffer.read(8 - len(prefix))
+    if not chunk:
+        sys.exit(2)
+    prefix.extend(chunk)
+size = int.from_bytes(prefix, "little")
+if size > cap:
+    sys.exit(2)
+payload = bytearray()
+while len(payload) < size:
+    chunk = sys.stdin.buffer.read(size - len(payload))
+    if not chunk:
+        sys.exit(2)
+    payload.extend(chunk)
+try:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except FileExistsError:
+    sys.exit(5)
+with os.fdopen(descriptor, "wb") as output:
+    output.write(payload)
+    output.flush()
+    os.fsync(output.fileno())
+sys.exit(0)
+"""
+
+# _READ_SCRIPT streams one bounded file to stdout. The path is opened without
+# following symlinks (O_NOFOLLOW on Linux); a missing path exits 3, another
+# open error such as a symlink loop exits 6, a non-regular file exits 6, and a
+# file larger than the byte limit exits 4. Otherwise the raw bytes are written
+# to stdout and flushed before exit 0.
+_READ_SCRIPT = """\
+import os
+import stat
+import sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except FileNotFoundError:
+    sys.exit(3)
+except OSError:
+    sys.exit(6)
+if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    sys.exit(6)
+if os.fstat(descriptor).st_size > limit:
+    sys.exit(4)
+with os.fdopen(descriptor, "rb") as source:
+    data = source.read(limit + 1)
+if len(data) > limit:
+    sys.exit(4)
+sys.stdout.buffer.write(data)
+sys.stdout.buffer.flush()
+sys.exit(0)
+"""
+
+# _EXTRACT_SCRIPT unpacks the staged attempt input tar directly into /work with
+# the strict "data" tar filter, which rejects absolute paths, traversal outside
+# the destination, symlinks, hard links, and device entries, and then unlinks
+# the archive itself.
+_EXTRACT_SCRIPT = """\
+import os
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], mode="r:") as archive:
+    archive.extractall("/work", filter="data")
+os.unlink(sys.argv[1])
+sys.exit(0)
+"""
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DeadlineExceeded("Deadline exceeded before the bounded exec completed")
+    return remaining
+
+
+def _poll_exec(client: Any, exec_id: str, deadline: float) -> int | None:
+    """Wait for one exec to finish and return its exit code within the deadline."""
+    while True:
+        remaining = _remaining_seconds(deadline)
+        state = client.api.exec_inspect(exec_id)
+        if not state.get("Running", False):
+            return state.get("ExitCode")
+        time.sleep(min(EXEC_POLL_SECONDS, remaining))
+
+
+def _exec_write_file(client: Any, container_id: str, path: str, data: bytes, deadline: float) -> None:
+    """Stage one file at a fixed path through an unprivileged stdin-framed exec."""
+    remaining = _remaining_seconds(deadline)
+    exec_id = client.api.exec_create(
+        container=container_id,
+        cmd=["python", "-I", "-c", _WRITE_SCRIPT, path, str(len(data))],
+        stdin=True, tty=False,
+    )["Id"]
+    stream = client.api.exec_start(exec_id, socket=True, tty=False)
+    try:
+        sock = stream._sock
+        sock.settimeout(remaining)
+        try:
+            sock.sendall(len(data).to_bytes(8, "little"))
+            for offset in range(0, len(data), EXEC_CHUNK_BYTES):
+                sock.sendall(data[offset:offset + EXEC_CHUNK_BYTES])
+        except socket.timeout as exc:
+            raise DeadlineExceeded(f"Deadline exceeded while staging {path}") from exc
+        exit_code = _poll_exec(client, exec_id, deadline)
+    finally:
+        stream.close()
+    if exit_code == 5:
+        raise RuntimeError(f"Overwrite rejected for {path}")
+    if exit_code != 0:
+        raise RuntimeError(f"Staging exec failed with exit code {exit_code} for {path}")
+
+
+def _exec_extract_tar(client: Any, container_id: str, archive_path: str, deadline: float) -> None:
+    """Extract the staged attempt input tar into /work through a fixed exec."""
+    _remaining_seconds(deadline)
+    exec_id = client.api.exec_create(
+        container_id, ["python", "-I", "-c", _EXTRACT_SCRIPT, archive_path],
+        stdin=False, tty=False,
+    )["Id"]
+    stream = client.api.exec_start(exec_id, socket=True, tty=False)
+    try:
+        exit_code = _poll_exec(client, exec_id, deadline)
+    finally:
+        stream.close()
+    if exit_code != 0:
+        raise RuntimeError(f"Input extraction exec failed with exit code {exit_code}")
+
+
+def _exec_read_file(client: Any, container_id: str, path: str, max_bytes: int, deadline: float) -> bytes:
+    """Read one bounded export file through an exec that frames bytes on stdout."""
+    remaining = _remaining_seconds(deadline)
+    exec_id = client.api.exec_create(
+        container_id, ["python", "-I", "-c", _READ_SCRIPT, path, str(max_bytes)],
+        stdout=True, stdin=False, tty=False,
+    )["Id"]
+    stream = client.api.exec_start(exec_id, socket=True, tty=False)
+    collected = bytearray()
+    try:
+        sock = stream._sock
+        sock.settimeout(remaining)
+        try:
+            while len(collected) <= max_bytes:
+                chunk = sock.recv(EXEC_CHUNK_BYTES)
+                if not chunk:
+                    break
+                collected.extend(chunk)
+        except socket.timeout as exc:
+            raise DeadlineExceeded(f"Deadline exceeded while reading {path}") from exc
+        exit_code = _poll_exec(client, exec_id, deadline)
+    finally:
+        stream.close()
+    if exit_code == 3:
+        raise ArtifactMissing(f"Export is missing: {path}")
+    if exit_code == 4 or len(collected) > max_bytes:
+        raise ValueError(f"Export exceeds byte limit: {path}")
+    if exit_code == 6:
+        raise ValueError(f"Export path is not a regular file or is a symlink: {path}")
+    if exit_code != 0:
+        raise RuntimeError(f"Read exec failed with exit code {exit_code} for {path}")
+    return bytes(collected)
 
 
 def _validate_attempt_archive(data: bytes) -> None:
@@ -144,23 +326,10 @@ def _limited_log(container: Any, *, stdout: bool) -> tuple[str, bool]:
     return captured.decode("utf-8", errors="replace"), truncated
 
 
-def _read_export(container: Any) -> dict[str, str]:
-    chunks, _ = container.get_archive("/work/export/probe.json")
-    buffer = bytearray()
-    for chunk in chunks:
-        if len(buffer) + len(chunk) > MAX_EXPORT_BYTES + 4096:
-            raise ValueError("Export exceeds byte limit")
-        buffer.extend(chunk)
-    with tarfile.open(fileobj=io.BytesIO(buffer), mode="r:") as archive:
-        members = archive.getmembers()
-        if len(members) != 1 or members[0].name != "probe.json" or not members[0].isfile():
-            raise ValueError("Unexpected export entry")
-        if members[0].size > MAX_EXPORT_BYTES:
-            raise ValueError("Export exceeds byte limit")
-        extracted = archive.extractfile(members[0])
-        if extracted is None:
-            raise ValueError("Export is unreadable")
-        content = extracted.read(MAX_EXPORT_BYTES + 1)
+def _read_export(client: Any, container_id: str, deadline: float) -> dict[str, str]:
+    content = _exec_read_file(
+        client, container_id, "/work/export/probe.json", MAX_EXPORT_BYTES, deadline
+    )
     value = json.loads(content)
     if not isinstance(value, dict) or set(value) != {"kind", "nonce"}:
         raise ValueError("Invalid probe export")
@@ -183,26 +352,8 @@ PREPARATION_ARTIFACTS = (
 )
 
 
-def _read_attempt_file(container: Any, name: str, max_bytes: int) -> bytes:
-    chunks, _ = container.get_archive(f"/work/export/{name}")
-    buffer = bytearray()
-    for chunk in chunks:
-        if len(buffer) + len(chunk) > max_bytes + 4096:
-            raise ValueError("Attempt export exceeds byte limit")
-        buffer.extend(chunk)
-    with tarfile.open(fileobj=io.BytesIO(buffer), mode="r:") as archive:
-        members = archive.getmembers()
-        if len(members) != 1 or members[0].name != name or not members[0].isfile():
-            raise ValueError("Unexpected attempt export entry")
-        if members[0].size > max_bytes:
-            raise ValueError("Attempt export exceeds byte limit")
-        extracted = archive.extractfile(members[0])
-        if extracted is None:
-            raise ValueError("Attempt export is unreadable")
-        content = extracted.read(max_bytes + 1)
-        if len(content) > max_bytes:
-            raise ValueError("Attempt export exceeds byte limit")
-        return content
+def _read_attempt_file(client: Any, container_id: str, name: str, max_bytes: int, deadline: float) -> bytes:
+    return _exec_read_file(client, container_id, f"/work/export/{name}", max_bytes, deadline)
 
 
 def _validate_attempt_marker(content: bytes, phase: str) -> dict[str, Any]:
@@ -350,6 +501,7 @@ class DockerRunner:
 
         started = time.monotonic()
         expires_at = int(time.time() + timeout_seconds)
+        deadline = started + timeout_seconds
         nonce = uuid4().hex
         container = None
         status = "infrastructure_failed"
@@ -364,13 +516,14 @@ class DockerRunner:
                 ["python", "-I", "/opt/upgrade_chamber/runner.py", kind], kind, expires_at
             )
             container.start()
-            if not container.put_archive("/work", _archive_file("input.json", json.dumps({"nonce": nonce}).encode())):
-                raise RuntimeError("Input staging failed")
-            if not container.put_archive("/work", _archive_file("ready", b"")):
-                raise RuntimeError("Ready marker staging failed")
+            _exec_write_file(
+                self.client, container.id, "/work/input.json",
+                json.dumps({"nonce": nonce}).encode(), deadline,
+            )
+            _exec_write_file(self.client, container.id, "/work/ready", b"", deadline)
 
-            deadline = started + timeout_seconds
             acknowledged = False
+            poll_interval = 0.05
             while True:
                 if time.monotonic() >= deadline:
                     status = "timed_out"
@@ -384,20 +537,32 @@ class DockerRunner:
                     break
                 if kind == "success" and not acknowledged:
                     try:
-                        exported = _read_export(container)
-                    except Exception as exc:
-                        if exc.__class__.__name__ != "NotFound":
-                            raise
+                        exported = _read_export(self.client, container.id, deadline)
+                    except ArtifactMissing:
+                        pass
                     else:
                         if exported != {"kind": "success", "nonce": nonce}:
                             raise ValueError("Probe export did not match staged input")
-                        if not container.put_archive("/work", _archive_file("ack", b"")):
-                            raise RuntimeError("Probe acknowledgement failed")
+                        _exec_write_file(self.client, container.id, "/work/ack", b"", deadline)
                         acknowledged = True
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                poll_interval = min(poll_interval * 2, 0.5)
 
             stdout, stdout_truncated = _limited_log(container, stdout=True)
             stderr, stderr_truncated = _limited_log(container, stdout=False)
+        except DeadlineExceeded as exc:
+            status = "timed_out"
+            error = f"{type(exc).__name__}: {exc}"
+            if container is not None:
+                try:
+                    container.kill()
+                except Exception as kill_exc:
+                    error = f"{error}; kill failed: {type(kill_exc).__name__}: {kill_exc}"
+                try:
+                    stdout, stdout_truncated = _limited_log(container, stdout=True)
+                    stderr, stderr_truncated = _limited_log(container, stdout=False)
+                except Exception as log_exc:
+                    error = f"{error}; log capture failed: {type(log_exc).__name__}: {log_exc}"
         except Exception as exc:
             status = "infrastructure_failed" if status != "timed_out" else status
             error = f"{type(exc).__name__}: {exc}"
@@ -435,6 +600,7 @@ class DockerRunner:
 
         started = time.monotonic()
         expires_at = int(time.time() + timeout_seconds)
+        deadline = started + timeout_seconds
         container = None
         status = "infrastructure_failed"
         exit_code = None
@@ -452,12 +618,11 @@ class DockerRunner:
                 f"profile-{phase}", expires_at,
             )
             container.start()
-            if not container.put_archive("/work", input_tar):
-                raise RuntimeError("Attempt input staging failed")
-            if not container.put_archive("/work", _archive_file("ready", b"")):
-                raise RuntimeError("Ready marker staging failed")
+            _exec_write_file(self.client, container.id, "/work/input.tar", input_tar, deadline)
+            _exec_extract_tar(self.client, container.id, "/work/input.tar", deadline)
+            _exec_write_file(self.client, container.id, "/work/ready", b"", deadline)
 
-            deadline = started + timeout_seconds
+            poll_interval = 0.25
             while True:
                 if time.monotonic() >= deadline:
                     status = "timed_out"
@@ -472,20 +637,21 @@ class DockerRunner:
                     break
                 if not acknowledged:
                     try:
-                        marker_bytes = _read_attempt_file(container, "attempt.json", MAX_SMALL_INPUT_BYTES)
-                    except Exception as exc:
-                        if exc.__class__.__name__ != "NotFound":
-                            raise
+                        marker_bytes = _read_attempt_file(
+                            self.client, container.id, "attempt.json", MAX_SMALL_INPUT_BYTES, deadline
+                        )
+                    except ArtifactMissing:
+                        pass
                     else:
                         marker = _validate_attempt_marker(marker_bytes, phase)
                         artifacts["attempt.json"] = marker_bytes
                         total = len(marker_bytes)
                         for name in ATTEMPT_ARTIFACTS:
                             try:
-                                content = _read_attempt_file(container, name, MAX_EXPORT_BYTES - total)
-                            except Exception as exc:
-                                if exc.__class__.__name__ != "NotFound":
-                                    raise
+                                content = _read_attempt_file(
+                                    self.client, container.id, name, MAX_EXPORT_BYTES - total, deadline
+                                )
+                            except ArtifactMissing:
                                 missing.append(name)
                             else:
                                 artifacts[name] = content
@@ -494,13 +660,26 @@ class DockerRunner:
                             name in missing for name in ATTEMPT_ARTIFACTS[:5]
                         ):
                             raise ValueError("Passed attempt is missing required evidence")
-                        if not container.put_archive("/work", _archive_file("ack", b"")):
-                            raise RuntimeError("Attempt acknowledgement failed")
+                        _exec_write_file(self.client, container.id, "/work/ack", b"", deadline)
                         acknowledged = True
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                poll_interval = min(poll_interval * 2, 1.0)
 
             stdout, stdout_truncated = _limited_log(container, stdout=True)
             stderr, stderr_truncated = _limited_log(container, stdout=False)
+        except DeadlineExceeded as exc:
+            status = "timed_out"
+            error = f"{type(exc).__name__}: {exc}"
+            if container is not None:
+                try:
+                    container.kill()
+                except Exception as kill_exc:
+                    error = f"{error}; kill failed: {type(kill_exc).__name__}: {kill_exc}"
+                try:
+                    stdout, stdout_truncated = _limited_log(container, stdout=True)
+                    stderr, stderr_truncated = _limited_log(container, stdout=False)
+                except Exception as log_exc:
+                    error = f"{error}; log capture failed: {type(log_exc).__name__}: {log_exc}"
         except Exception as exc:
             if status != "timed_out":
                 status = "infrastructure_failed"
@@ -537,6 +716,7 @@ class DockerRunner:
 
         started = time.monotonic()
         expires_at = int(time.time() + timeout_seconds)
+        deadline = started + timeout_seconds
         container = None
         status = "infrastructure_failed"
         exit_code = None
@@ -554,10 +734,9 @@ class DockerRunner:
                 "preparation", expires_at, network_mode="bridge",
             )
             container.start()
-            if not container.put_archive("/work", _archive_file("ready", b"")):
-                raise RuntimeError("Ready marker staging failed")
+            _exec_write_file(self.client, container.id, "/work/ready", b"", deadline)
 
-            deadline = started + timeout_seconds
+            poll_interval = 0.25
             while True:
                 if time.monotonic() >= deadline:
                     status = "timed_out"
@@ -575,20 +754,21 @@ class DockerRunner:
                     break
                 if not acknowledged:
                     try:
-                        marker_bytes = _read_attempt_file(container, "preparation.json", MAX_SMALL_INPUT_BYTES)
-                    except Exception as exc:
-                        if exc.__class__.__name__ != "NotFound":
-                            raise
+                        marker_bytes = _read_attempt_file(
+                            self.client, container.id, "preparation.json", MAX_SMALL_INPUT_BYTES, deadline
+                        )
+                    except ArtifactMissing:
+                        pass
                     else:
                         marker = _validate_preparation_marker(marker_bytes)
                         artifacts["preparation.json"] = marker_bytes
                         total = len(marker_bytes)
                         for name in PREPARATION_ARTIFACTS:
                             try:
-                                content = _read_attempt_file(container, name, MAX_EXPORT_BYTES - total)
-                            except Exception as exc:
-                                if exc.__class__.__name__ != "NotFound":
-                                    raise
+                                content = _read_attempt_file(
+                                    self.client, container.id, name, MAX_EXPORT_BYTES - total, deadline
+                                )
+                            except ArtifactMissing:
                                 missing.append(name)
                             else:
                                 artifacts[name] = content
@@ -598,13 +778,26 @@ class DockerRunner:
                                 raise ValueError("Prepared bundle is missing required evidence")
                             _validate_attempt_archive(artifacts["baseline.tar"])
                             _validate_attempt_archive(artifacts["candidate.tar"])
-                        if not container.put_archive("/work", _archive_file("ack", b"")):
-                            raise RuntimeError("Preparation acknowledgement failed")
+                        _exec_write_file(self.client, container.id, "/work/ack", b"", deadline)
                         acknowledged = True
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                poll_interval = min(poll_interval * 2, 1.0)
 
             stdout, stdout_truncated = _limited_log(container, stdout=True)
             stderr, stderr_truncated = _limited_log(container, stdout=False)
+        except DeadlineExceeded as exc:
+            status = "timed_out"
+            error = f"{type(exc).__name__}: {exc}"
+            if container is not None:
+                try:
+                    container.kill()
+                except Exception as kill_exc:
+                    error = f"{error}; kill failed: {type(kill_exc).__name__}: {kill_exc}"
+                try:
+                    stdout, stdout_truncated = _limited_log(container, stdout=True)
+                    stderr, stderr_truncated = _limited_log(container, stdout=False)
+                except Exception as log_exc:
+                    error = f"{error}; log capture failed: {type(log_exc).__name__}: {log_exc}"
         except Exception as exc:
             if status != "timed_out":
                 status = "infrastructure_failed"

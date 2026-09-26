@@ -2,10 +2,23 @@
 
 import io
 import json
+import os
+import subprocess
+import sys
 import tarfile
+import tempfile
 import unittest
 
-from upgrade_chamber.runner import CleanupError, DockerRunner, MAX_LOG_BYTES, _validate_attempt_archive
+from upgrade_chamber.runner import (
+    MAX_EXPORT_BYTES,
+    MAX_LOG_BYTES,
+    CleanupError,
+    DockerRunner,
+    _EXTRACT_SCRIPT,
+    _READ_SCRIPT,
+    _WRITE_SCRIPT,
+    _validate_attempt_archive,
+)
 
 
 IMAGE = "python-runner@sha256:" + "a" * 64
@@ -14,15 +27,6 @@ LOCAL_IMAGE = "sha256:" + "b" * 64
 
 class NotFound(Exception):
     pass
-
-
-def archive_file(name: str, content: bytes) -> bytes:
-    output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w") as archive:
-        info = tarfile.TarInfo(name)
-        info.size = len(content)
-        archive.addfile(info, io.BytesIO(content))
-    return output.getvalue()
 
 
 def attempt_bundle() -> bytes:
@@ -60,13 +64,168 @@ def attempt_marker(status: str = "passed") -> dict:
     }
 
 
+class FakeExecRecord:
+    """One interpreted exec: the fake parses the fixed argv contract."""
+
+    def __init__(self, exec_id: str, cmd: list, container: "FakeContainer"):
+        self.id = exec_id
+        self.cmd = cmd
+        self.container = container
+        self.running = True
+        self.exit_code = None
+        self.chunks: list[bytes] = []
+        self.buffer = bytearray()
+        self.timeouts: list[float] = []
+        self.hangs = False
+
+    def finalize_write(self) -> None:
+        """Interpret a framed write once the 8-byte prefix and payload arrived."""
+        if self.hangs or self.exit_code is not None:
+            return
+        if len(self.buffer) < 8:
+            return
+        size = int.from_bytes(self.buffer[:8], "little")
+        cap = int(self.cmd[5])
+        if size > cap:
+            self.exit_code = 2
+            self.running = False
+            return
+        if len(self.buffer) < 8 + size:
+            return
+        payload = bytes(self.buffer[8:8 + size])
+        path = self.cmd[4]
+        if path in self.container.files:
+            self.exit_code = 5
+        else:
+            self.container.files[path] = payload
+            if path == "/work/input.json":
+                self.container.nonce = json.loads(payload)["nonce"]
+            if path == "/work/ack":
+                self.container.acknowledged = True
+            self.container.events.append(f"write:{path}")
+            self.exit_code = 0
+        self.running = False
+
+
+class FakeRawSocket:
+    def __init__(self, record: FakeExecRecord):
+        self.record = record
+        self.closed = False
+        self.timeout = None
+
+    def settimeout(self, value):
+        self.record.timeouts.append(value)
+        self.timeout = value
+
+    def sendall(self, data):
+        assert not self.closed
+        assert self.record.cmd[3] is _WRITE_SCRIPT
+        self.record.buffer.extend(data)
+        self.record.finalize_write()
+
+    def recv(self, size):
+        if self.record.chunks:
+            return self.record.chunks.pop(0)
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+class FakeSocketIO:
+    def __init__(self, record: FakeExecRecord):
+        self._sock = FakeRawSocket(record)
+
+    def close(self):
+        self._sock.close()
+
+
+class FakeExecAPI:
+    def __init__(self, container: "FakeContainer"):
+        self.container = container
+        self.execs: dict[str, FakeExecRecord] = {}
+        self.counter = 0
+
+    def exec_create(self, container, cmd, stdout=True, stderr=True, stdin=False, tty=False, **_):
+        assert container == self.container.id
+        assert not tty
+        script = cmd[3]
+        if script is _WRITE_SCRIPT:
+            assert stdin
+        else:
+            assert script is _READ_SCRIPT or script is _EXTRACT_SCRIPT
+            assert not stdin
+        self.counter += 1
+        record = FakeExecRecord(f"exec-{self.counter}", list(cmd), self.container)
+        if script is _WRITE_SCRIPT:
+            record.hangs = self.container.hang_execs
+        elif script is _READ_SCRIPT:
+            self._finalize_read(record)
+        else:
+            self._finalize_extract(record)
+        self.execs[record.id] = record
+        return {"Id": record.id}
+
+    def exec_start(self, exec_id, detach=False, tty=False, stream=False, socket=False, demux=False):
+        assert socket and not detach and not stream and not demux and not tty
+        return FakeSocketIO(self.execs[exec_id])
+
+    def exec_inspect(self, exec_id):
+        record = self.execs[exec_id]
+        return {"Running": record.running, "ExitCode": record.exit_code}
+
+    def _finalize_read(self, record: FakeExecRecord) -> None:
+        container = self.container
+        path, limit = record.cmd[4], int(record.cmd[5])
+        if container.attrs["State"]["Running"]:
+            container.export_read_while_running = True
+        if (container.kind == "success" and path == "/work/export/probe.json"
+                and path not in container.files and path not in container.symlinks
+                and container.nonce is not None):
+            container.files[path] = json.dumps({"kind": "success", "nonce": container.nonce}).encode()
+        if path in container.symlinks:
+            record.exit_code = 6
+        elif path not in container.files:
+            record.exit_code = 3
+        elif len(container.files[path]) > limit:
+            record.exit_code = 4
+        else:
+            record.chunks = [container.files[path]]
+            record.exit_code = 0
+        record.running = False
+
+    def _finalize_extract(self, record: FakeExecRecord) -> None:
+        container = self.container
+        archive_path = record.cmd[4]
+        data = container.files.get(archive_path)
+        if data is None:
+            record.exit_code = 1
+        else:
+            try:
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+                    for member in archive.getmembers():
+                        name = member.name
+                        if not member.isfile() or name.startswith("/") or ".." in name.split("/"):
+                            raise ValueError("unsafe tar member")
+                        container.files[f"/work/{name}"] = archive.extractfile(member).read()
+            except (tarfile.TarError, ValueError):
+                record.exit_code = 1
+            else:
+                container.files.pop(archive_path, None)
+                container.events.append(f"extract:{archive_path}")
+                record.exit_code = 0
+        record.running = False
+
+
 class FakeContainer:
-    def __init__(self, kind: str, *, stage_fails: bool = False, remove_fails: bool = False, flood: bool = False):
+    def __init__(self, kind: str, *, remove_fails: bool = False, flood: bool = False,
+                 hang_execs: bool = False, preset_files: dict | None = None,
+                 preset_symlinks: set | None = None):
         self.id = "fake-1"
         self.kind = kind
-        self.stage_fails = stage_fails
         self.remove_fails = remove_fails
         self.flood = flood
+        self.hang_execs = hang_execs
         self.labels = {}
         self.started = False
         self.killed = False
@@ -74,21 +233,13 @@ class FakeContainer:
         self.nonce = None
         self.acknowledged = False
         self.export_read_while_running = False
+        self.files = dict(preset_files or {})
+        self.symlinks = set(preset_symlinks or ())
+        self.events: list[str] = []
         self.attrs = {"State": {"Running": True, "ExitCode": None}}
 
     def start(self):
         self.started = True
-
-    def put_archive(self, path, data):
-        if self.stage_fails:
-            return False
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
-            member = archive.getmembers()[0]
-            if member.name == "input.json":
-                self.nonce = json.load(archive.extractfile(member))["nonce"]
-            if member.name == "ack":
-                self.acknowledged = True
-        return True
 
     def reload(self):
         if self.kind == "success" and self.acknowledged:
@@ -103,11 +254,6 @@ class FakeContainer:
         if self.flood and stdout:
             return iter([b"a" * (MAX_LOG_BYTES + 100)])
         return iter([b"fake output"] if stdout else [])
-
-    def get_archive(self, path):
-        assert path == "/work/export/probe.json"
-        self.export_read_while_running = self.attrs["State"]["Running"]
-        return iter([archive_file("probe.json", json.dumps({"kind": "success", "nonce": self.nonce}).encode())]), {}
 
     def remove(self, *, force):
         assert force
@@ -140,28 +286,24 @@ class FakeContainers:
 class FakeDocker:
     def __init__(self, container):
         self.containers = FakeContainers(container)
+        self.api = FakeExecAPI(container)
 
 
 class FakeAttemptContainer(FakeContainer):
     def __init__(self, marker: dict, files: dict[str, bytes]):
         super().__init__("success")
-        self.files = {"attempt.json": json.dumps(marker).encode(), **files}
-
-    def get_archive(self, path):
-        name = path.rsplit("/", 1)[-1]
-        if name not in self.files:
-            raise NotFound()
-        self.export_read_while_running = self.attrs["State"]["Running"]
-        return iter([archive_file(name, self.files[name])]), {}
+        self.files.update({f"/work/export/{name}": data for name, data in files.items()})
+        self.files["/work/export/attempt.json"] = json.dumps(marker).encode()
 
 
-class FakePreparationContainer(FakeAttemptContainer):
+class FakePreparationContainer(FakeContainer):
     def __init__(self, status: str = "prepared", files: dict[str, bytes] | None = None):
-        FakeContainer.__init__(self, "success")
+        super().__init__("success")
         self.preparation_status = status
         marker = {"schema_version": 1, "status": status, "error": None if status == "prepared" else "Download failed",
                   "summary": {} if status == "prepared" else None}
-        self.files = {"preparation.json": json.dumps(marker).encode(), **(files or {})}
+        self.files.update({f"/work/export/{name}": data for name, data in (files or {}).items()})
+        self.files["/work/export/preparation.json"] = json.dumps(marker).encode()
 
     def reload(self):
         if self.acknowledged:
@@ -310,12 +452,20 @@ class RunnerTests(unittest.TestCase):
         following = DockerRunner(IMAGE, FakeDocker(FakeContainer("success"))).run_probe("success")
         self.assertEqual(following.status, "completed")
 
-    def test_staging_failure_still_removes_container(self):
-        container = FakeContainer("success", stage_fails=True)
+    def test_overwrite_rejection_still_removes_container(self):
+        container = FakeContainer("success", preset_files={"/work/input.json": b"stale"})
         result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("success")
         self.assertEqual(result.status, "infrastructure_failed")
+        self.assertIn("Overwrite rejected", result.error)
         self.assertTrue(result.removal_observed)
-        self.assertIn("Input staging failed", result.error)
+
+    def test_ready_overwrite_rejected_in_attempt(self):
+        container = FakeAttemptContainer(attempt_marker(), {})
+        container.files["/work/ready"] = b"stale"
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_profile_attempt(attempt_bundle(), phase="baseline")
+        self.assertEqual(result.status, "infrastructure_failed")
+        self.assertIn("Overwrite rejected", result.error)
+        self.assertTrue(result.removal_observed)
 
     def test_cleanup_failure_blocks_result(self):
         container = FakeContainer("success", remove_fails=True)
@@ -346,17 +496,96 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.remove_expired_containers(now=11), [])
         self.assertFalse(container.removed)
 
-    def test_export_rejects_extra_tar_entry_and_removes_container(self):
-        class BadExportContainer(FakeContainer):
-            def get_archive(self, path):
-                self.export_read_while_running = self.attrs["State"]["Running"]
-                return iter([archive_file("unexpected.json", b"{}")]), {}
-
-        container = BadExportContainer("success")
+    def test_symlinked_export_rejected_and_removed(self):
+        container = FakeContainer("success", preset_symlinks={"/work/export/probe.json"})
         result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("success")
         self.assertEqual(result.status, "infrastructure_failed")
-        self.assertIn("Unexpected export entry", result.error)
+        self.assertIn("not a regular file or is a symlink", result.error)
         self.assertTrue(result.removal_observed)
+
+    def test_oversize_export_rejected_and_removed(self):
+        container = FakeContainer("success", preset_files={"/work/export/probe.json": b"x" * (MAX_EXPORT_BYTES + 1)})
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("success")
+        self.assertEqual(result.status, "infrastructure_failed")
+        self.assertIn("exceeds byte limit", result.error)
+        self.assertTrue(result.removal_observed)
+
+    def test_attempt_input_lands_as_work_files_before_ready(self):
+        files = {name: b"evidence" for name in
+                 ("collect.txt", "junit.xml", "pip-report.json", "pip-check.txt", "installed.json")}
+        container = FakeAttemptContainer(attempt_marker(), files)
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_profile_attempt(attempt_bundle(), phase="baseline")
+        self.assertEqual(result.status, "passed")
+        for name in ("/work/source.zip", "/work/requirements.txt", "/work/manifest.json", "/work/wheels/requests.whl"):
+            self.assertIn(name, container.files)
+        self.assertNotIn("/work/input.tar", container.files)
+        self.assertIn("/work/ready", container.files)
+        self.assertIn("/work/ack", container.files)
+        staged = container.events.index("write:/work/input.tar")
+        extracted = container.events.index("extract:/work/input.tar")
+        ready = container.events.index("write:/work/ready")
+        self.assertLess(staged, extracted)
+        self.assertLess(extracted, ready)
+
+    def test_exec_deadline_marks_timeout_kills_and_removes(self):
+        container = FakeContainer("success", hang_execs=True)
+        result = DockerRunner(IMAGE, FakeDocker(container)).run_probe("success", timeout_seconds=0.3)
+        self.assertEqual(result.status, "timed_out")
+        self.assertTrue(container.killed)
+        self.assertTrue(result.removal_observed)
+        self.assertIn("DeadlineExceeded", result.error)
+
+    def test_write_script_frames_payload_and_rejects_overwrite(self):
+        with tempfile.TemporaryDirectory() as base:
+            target = os.path.join(base, "staged.bin")
+            payload = b"frame-payload"
+            argv = [sys.executable, "-I", "-c", _WRITE_SCRIPT, target, str(len(payload))]
+            framed = len(payload).to_bytes(8, "little") + payload
+            first = subprocess.run(argv, input=framed, capture_output=True)
+            self.assertEqual(first.returncode, 0)
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+            second = subprocess.run(argv, input=framed, capture_output=True)
+            self.assertEqual(second.returncode, 5)
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+            short = subprocess.run(argv, input=framed[:-1], capture_output=True)
+            self.assertEqual(short.returncode, 2)
+            oversize = subprocess.run(argv, input=(len(payload) + 1).to_bytes(8, "little"), capture_output=True)
+            self.assertEqual(oversize.returncode, 2)
+
+    def test_read_script_serves_bounded_regular_files(self):
+        with tempfile.TemporaryDirectory() as base:
+            target = os.path.join(base, "export.bin")
+            payload = b"export-bytes"
+            with open(target, "wb") as handle:
+                handle.write(payload)
+
+            def run(path, limit):
+                return subprocess.run(
+                    [sys.executable, "-I", "-c", _READ_SCRIPT, path, str(limit)],
+                    capture_output=True,
+                )
+
+            served = run(target, len(payload))
+            self.assertEqual(served.returncode, 0)
+            self.assertEqual(served.stdout, payload)
+            missing = run(os.path.join(base, "absent.bin"), 10)
+            self.assertEqual(missing.returncode, 3)
+            oversize = run(target, len(payload) - 1)
+            self.assertEqual(oversize.returncode, 4)
+            directory = run(base, 10)
+            self.assertEqual(directory.returncode, 6)
+            if hasattr(os, "O_NOFOLLOW"):
+                link = None
+                try:
+                    link = os.path.join(base, "link.bin")
+                    os.symlink(target, link)
+                except (NotImplementedError, OSError):
+                    link = None
+                if link is not None:
+                    rejected = run(link, 100)
+                    self.assertEqual(rejected.returncode, 6)
 
 
 if __name__ == "__main__":
