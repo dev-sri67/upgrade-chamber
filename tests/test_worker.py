@@ -636,7 +636,7 @@ class WorkerTests(unittest.TestCase):
             payload = call["payload"]
             self.assertEqual(set(payload), {"run_id", "messages", "max_tokens"})
             self.assertEqual(payload["run_id"], run_id)
-            self.assertEqual(payload["max_tokens"], 4096)
+            self.assertEqual(payload["max_tokens"], 16384)
             self.assertLessEqual(len(payload["messages"]), 24)
             self.assertEqual(payload["messages"][0]["role"], "system")
             for message in payload["messages"]:

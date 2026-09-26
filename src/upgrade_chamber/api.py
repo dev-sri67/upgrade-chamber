@@ -78,7 +78,7 @@ class AgentTurnRequest(BaseModel):
 
     run_id: int
     messages: list[AgentTurnMessage] = Field(min_length=1, max_length=24)
-    max_tokens: int = Field(ge=1, le=8192)
+    max_tokens: int = Field(ge=1, le=16384)
 
 
 class SelectRequest(BaseModel):
@@ -464,7 +464,7 @@ def _register_routes(application: FastAPI, runtime: Callable[[], tuple[Settings,
             },
         ]
         try:
-            result = structured_call(settings, messages, max_tokens=512)
+            result = structured_call(settings, messages, max_tokens=4096)
         except (InferenceError, ValueError) as exc:
             raise ApiError(502, "inference_unavailable", str(exc)[:500]) from None
         content = _structured_content(result)

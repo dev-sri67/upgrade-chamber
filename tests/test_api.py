@@ -456,7 +456,7 @@ class InternalInferenceTests(unittest.TestCase):
             "usage": {"total_tokens": 7},
         })
         self.assertEqual(len(stub.calls), 1)
-        self.assertEqual(stub.calls[0]["max_tokens"], 512)
+        self.assertEqual(stub.calls[0]["max_tokens"], 4096)
         self.assertEqual(stub.calls[0]["messages"][0]["role"], "system")
         self.assertEqual(
             stub.calls[0]["messages"][0]["content"],
@@ -589,13 +589,22 @@ class InternalInferenceTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "invalid_request")
         self.assertIn("content", response.json()["error"]["message"])
 
+    def test_agent_turn_accepts_large_reasoning_budget(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = agent_turn_result()
+        response = client.post(
+            "/internal/inference/agent-turn", json=agent_turn_body(max_tokens=9000))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(stub.calls[0]["max_tokens"], 9000)
+
     def test_agent_turn_body_shape_and_caps_rejected(self):
         stub = StubInference()
         client, _ = self.make_client(stub)
         for body in (
             agent_turn_body(messages=[]),
             agent_turn_body(max_tokens=0),
-            agent_turn_body(max_tokens=8193),
+            agent_turn_body(max_tokens=17000),
             agent_turn_body(messages=[{"role": "tool", "content": "not allowed"}]),
             {**agent_turn_body(), "unexpected": True},
         ):

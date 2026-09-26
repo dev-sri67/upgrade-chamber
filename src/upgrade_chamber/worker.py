@@ -275,7 +275,7 @@ class Worker:
     def _agent_model_call(self, run_id: int, messages: list[dict[str, str]]) -> dict[str, Any]:
         """POST one agent conversation turn to the internal inference endpoint.
 
-        Sends the full worker-owned conversation with the fixed 4096 token
+        Sends the full worker-owned conversation with the fixed 16384 token
         cap and returns the trimmed {"message", "usage"} pair the agent
         session consumes. The latest response model_id is recorded on
         ``self._agent_model_id`` so run evidence can name the model.
@@ -283,7 +283,7 @@ class Worker:
         response = self._internal_post("/internal/inference/agent-turn", {
             "run_id": run_id,
             "messages": messages,
-            "max_tokens": 4096,
+            "max_tokens": 16384,
         })
         self._agent_model_id = response.get("model_id")
         return {"message": response["message"], "usage": response["usage"]}

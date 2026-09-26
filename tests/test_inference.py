@@ -93,6 +93,20 @@ def test_prompt_schema_and_byte_limits_fail_before_request():
             inference.chat_completion([{"role": "user", "content": "hello"}] * 25)
 
 
+def test_max_tokens_budget_covers_hidden_reasoning_headroom():
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        inference = VultrInferenceClient(settings, client)
+        assert inference.chat_completion(
+            [{"role": "user", "content": "hello"}], max_tokens=16384) == "ok"
+        with pytest.raises(ValueError, match="bounded"):
+            inference.chat_completion(
+                [{"role": "user", "content": "hello"}], max_tokens=16385)
+
+
 def test_redirect_is_rejected_even_when_injected_client_follows_redirects(capsys):
     seen = []
 
