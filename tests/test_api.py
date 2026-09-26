@@ -1,5 +1,6 @@
 """API contract checks: admission, run records, events, cancellation, artifacts, and readiness."""
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from upgrade_chamber.api import create_app
 from upgrade_chamber.config import Settings
+from upgrade_chamber.inference import InferenceError, StructuredResult
 from upgrade_chamber.profiles import ENABLED_PROFILES
 from upgrade_chamber.storage import Store
 
@@ -58,13 +60,74 @@ def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+class StubInference:
+    """Test double exposing chat_completion_structured with a scripted result."""
+
+    def __init__(self) -> None:
+        self.result = None
+        self.calls = []
+
+    def chat_completion_structured(self, messages, *, max_tokens, correction_prompt):
+        self.calls.append(
+            {
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "correction_prompt": correction_prompt,
+            }
+        )
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def select_body(**overrides) -> dict:
+    body = {
+        "run_id": 1,
+        "package": "requests",
+        "eligible_versions": ["2.31.0", "2.32.0"],
+        "context": "The repository uses requests for all HTTP calls.",
+    }
+    body.update(overrides)
+    return body
+
+
+def repair_body(**overrides) -> dict:
+    body = {
+        "run_id": 1,
+        "package": "requests",
+        "target_version": "2.32.0",
+        "failure_context": "tests fail under the target version",
+        "file_contexts": [{"path": "src/example.py", "content": "value = 1\n"}],
+        "allowed_paths": ["src/example.py"],
+    }
+    body.update(overrides)
+    return body
+
+
+def selection_result(**overrides) -> StructuredResult:
+    content = {"package": "requests", "target_version": "2.32.0", "rationale": "minor bump"}
+    content.update(overrides)
+    return StructuredResult(ok=True, content=content, usage={"total_tokens": 7}, attempts=1, error=None)
+
+
+def repair_result(**overrides) -> StructuredResult:
+    content = {
+        "summary": "bumped the constant",
+        "edits": [
+            {"path": "src/example.py", "original_sha256": "a" * 64, "replacement_text": "value = 2\n"}
+        ],
+    }
+    content.update(overrides)
+    return StructuredResult(ok=True, content=content, usage=None, attempts=2, error=None)
+
+
 class ApiContractTests(unittest.TestCase):
     def setUp(self):
         self._context = tempfile.TemporaryDirectory()
         self.addCleanup(self._context.cleanup)
         self.base = Path(self._context.name)
 
-    def make_client(self, **overrides):
+    def make_client(self, inference_factory=None, **overrides):
         settings = Settings(
             database_path=str(self.base / "runs.db"),
             artifact_dir=str(self.base / "artifacts"),
@@ -73,7 +136,7 @@ class ApiContractTests(unittest.TestCase):
         )
         store = Store(settings.database_path, settings.artifact_dir)
         self.addCleanup(store.close)
-        client = TestClient(create_app(settings, store))
+        client = TestClient(create_app(settings, store, inference_factory=inference_factory))
         return client, store, settings
 
     def test_healthz(self):
@@ -352,6 +415,188 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(same.status_code, 200)
         absent = client.get("/healthz")
         self.assertEqual(absent.status_code, 200)
+
+
+class InternalInferenceTests(unittest.TestCase):
+    """Contract checks for the shared internal inference endpoints."""
+
+    def setUp(self):
+        self._context = tempfile.TemporaryDirectory()
+        self.addCleanup(self._context.cleanup)
+        self.base = Path(self._context.name)
+
+    def make_client(self, stub, **overrides):
+        params = {
+            "database_path": str(self.base / "runs.db"),
+            "artifact_dir": str(self.base / "artifacts"),
+            "worker_image": "python-runner@sha256:" + "b" * 64,
+            "vultr_model_id": "vultr-model-1",
+        }
+        params.update(overrides)
+        settings = Settings(**params)
+        store = Store(settings.database_path, settings.artifact_dir)
+        self.addCleanup(store.close)
+        client = TestClient(create_app(settings, store, inference_factory=lambda _settings: stub))
+        return client, settings
+
+    def test_select_happy_path(self):
+        stub = StubInference()
+        client, settings = self.make_client(stub)
+        stub.result = selection_result()
+        response = client.post("/internal/inference/select", json=select_body())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "selection": {
+                "package": "requests",
+                "target_version": "2.32.0",
+                "rationale": "minor bump",
+            },
+            "model_id": settings.vultr_model_id,
+            "attempts": 1,
+            "usage": {"total_tokens": 7},
+        })
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.calls[0]["max_tokens"], 512)
+        self.assertEqual(stub.calls[0]["messages"][0]["role"], "system")
+        self.assertEqual(
+            stub.calls[0]["messages"][0]["content"],
+            "You are a dependency upgrade selector for a Python repository. Choose exactly one "
+            "eligible target version from the provided list. Respond ONLY with a single JSON object: "
+            "{\"package\": \"...\", \"target_version\": \"...\", \"rationale\": \"...\"}. "
+            "The rationale must be at most 2000 characters.",
+        )
+        self.assertEqual(
+            stub.calls[0]["messages"][1]["content"],
+            "Package: requests\n"
+            "Eligible target versions: [\"2.31.0\", \"2.32.0\"]\n"
+            "Repository context (bounded):\nThe repository uses requests for all HTTP calls.",
+        )
+
+    def test_select_out_of_list_version_rejected(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = selection_result(target_version="9.9.9")
+        response = client.post("/internal/inference/select", json=select_body())
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_selection")
+        self.assertIn("eligible", response.json()["error"]["message"])
+
+    def test_select_failed_structured_result_maps_to_502(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = StructuredResult(
+            ok=False,
+            content=None,
+            usage=None,
+            attempts=2,
+            error="structured response invalid after one correction retry",
+        )
+        response = client.post("/internal/inference/select", json=select_body())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "inference_unavailable")
+        self.assertIn("structured response invalid", response.json()["error"]["message"])
+
+    def test_select_transport_error_maps_to_502(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = InferenceError("Vultr inference transport failed")
+        response = client.post("/internal/inference/select", json=select_body())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "inference_unavailable")
+
+    def test_select_requires_model_settings(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub, vultr_model_id=None)
+        stub.result = selection_result()
+        response = client.post("/internal/inference/select", json=select_body())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["message"], "model id not configured")
+
+    def test_repair_happy_path(self):
+        stub = StubInference()
+        client, settings = self.make_client(stub)
+        stub.result = repair_result()
+        response = client.post("/internal/inference/repair", json=repair_body())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "repair": {
+                "summary": "bumped the constant",
+                "edits": [{
+                    "path": "src/example.py",
+                    "original_sha256": "a" * 64,
+                    "replacement_text": "value = 2\n",
+                }],
+            },
+            "model_id": settings.vultr_model_id,
+            "attempts": 2,
+            "usage": None,
+        })
+        self.assertEqual(stub.calls[0]["max_tokens"], 4096)
+        user_content = stub.calls[0]["messages"][1]["content"]
+        self.assertIn("src/example.py", user_content)
+        self.assertIn(hashlib.sha256(b"value = 1\n").hexdigest(), user_content)
+        self.assertIn('["src/example.py"]', user_content)
+
+    def test_repair_six_edits_rejected(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        six_edits = [
+            {"path": f"src/file{i}.py", "original_sha256": "a" * 64, "replacement_text": "x = 1\n"}
+            for i in range(6)
+        ]
+        stub.result = repair_result(edits=six_edits)
+        response = client.post("/internal/inference/repair", json=repair_body())
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_repair")
+
+    def test_repair_failure_context_over_cap_rejected(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = repair_result()
+        response = client.post(
+            "/internal/inference/repair", json=repair_body(failure_context="x" * 12001))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertIn("failure_context", response.json()["error"]["message"])
+
+    def test_internal_token_required_when_configured(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub, internal_token="secret-token")
+        stub.result = selection_result()
+        missing = client.post("/internal/inference/select", json=select_body())
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(missing.json()["error"]["code"], "unauthorized")
+        wrong = client.post(
+            "/internal/inference/select", json=select_body(), headers={"X-Internal-Token": "nope"})
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(wrong.json()["error"]["code"], "unauthorized")
+        good = client.post(
+            "/internal/inference/select",
+            json=select_body(),
+            headers={"X-Internal-Token": "secret-token"},
+        )
+        self.assertEqual(good.status_code, 200)
+
+        stub.result = repair_result()
+        repair_missing = client.post("/internal/inference/repair", json=repair_body())
+        self.assertEqual(repair_missing.status_code, 401)
+        self.assertEqual(repair_missing.json()["error"]["code"], "unauthorized")
+        repair_good = client.post(
+            "/internal/inference/repair",
+            json=repair_body(),
+            headers={"X-Internal-Token": "secret-token"},
+        )
+        self.assertEqual(repair_good.status_code, 200)
+
+    def test_internal_endpoints_open_without_token(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = selection_result()
+        self.assertEqual(
+            client.post("/internal/inference/select", json=select_body()).status_code, 200)
+        stub.result = repair_result()
+        self.assertEqual(
+            client.post("/internal/inference/repair", json=repair_body()).status_code, 200)
 
 
 if __name__ == "__main__":

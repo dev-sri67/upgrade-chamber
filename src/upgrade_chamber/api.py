@@ -1,11 +1,19 @@
-"""Public API: admission-controlled run submission, status, events, cancellation, artifacts."""
+"""Public API: admission-controlled run submission, status, events, cancellation, artifacts.
 
+Internal endpoints POST /internal/inference/select and /internal/inference/repair wrap the
+structured inference calls for the worker; they carry no run-token auth and persist nothing
+about runs.
+"""
+
+import hashlib
+import hmac
 import json
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Callable
+from typing import Annotated, Any, Callable
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
@@ -15,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from upgrade_chamber.config import Settings
+from upgrade_chamber.inference import InferenceError, StructuredResult, VultrInferenceClient
 from upgrade_chamber.profiles import (
     UnsupportedProfileError,
     public_catalog,
@@ -50,6 +59,61 @@ class RunSubmission(BaseModel):
     idempotency_key: str | None = Field(default=None, max_length=200)
 
 
+class FileContext(BaseModel):
+    """One bounded source file snapshot supplied to a repair request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    path: str
+    content: str = Field(max_length=12000)
+
+
+class SelectRequest(BaseModel):
+    """Strict body for POST /internal/inference/select."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: int
+    package: str
+    eligible_versions: list[str] = Field(min_length=1, max_length=8)
+    context: str = Field(max_length=8000)
+
+
+class RepairRequest(BaseModel):
+    """Strict body for POST /internal/inference/repair."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: int
+    package: str
+    target_version: str
+    failure_context: str = Field(max_length=12000)
+    file_contexts: list[FileContext] = Field(min_length=1, max_length=4)
+    allowed_paths: list[str] = Field(min_length=1, max_length=8)
+
+
+_SELECT_SYSTEM_PROMPT = (
+    "You are a dependency upgrade selector for a Python repository. Choose exactly one "
+    "eligible target version from the provided list. Respond ONLY with a single JSON object: "
+    '{"package": "...", "target_version": "...", "rationale": "..."}. '
+    "The rationale must be at most 2000 characters."
+)
+
+_REPAIR_SYSTEM_PROMPT = (
+    "You are a compatibility repairer for one Python package upgrade. Propose the smallest "
+    "safe source change that makes the failing tests pass under the target version. Edit only "
+    "files from the provided allowed paths; never edit tests, test configuration, or CI. "
+    "Respond ONLY with a single JSON object: "
+    '{"summary": "...", "edits": [{"path": "...", "original_sha256": "...", "replacement_text": "..."}]}. '
+    "The replacement_text must be the complete new content of that file."
+)
+
+_STRUCTURED_CORRECTION_PROMPT = (
+    "Your previous reply was not a single JSON object of the required shape. "
+    "Respond ONLY with the JSON object."
+)
+
+
 _ARTIFACT_MEDIA_TYPES = {
     ".json": "application/json",
     ".txt": "text/plain",
@@ -60,6 +124,70 @@ _ARTIFACT_MEDIA_TYPES = {
 }
 
 _HTTP_ERROR_CODES = {404: "not_found", 405: "method_not_allowed"}
+
+
+def _selection_violation(content: dict, package: str, eligible_versions: list[str]) -> str | None:
+    """Name the first violated selection schema or eligibility check, if any."""
+    if set(content) != {"package", "target_version", "rationale"}:
+        return "Selection JSON must have exactly the keys package, target_version, and rationale."
+    if content["package"] != package:
+        return "Selection package must equal the requested package."
+    if content["target_version"] not in eligible_versions:
+        return "Selection target_version must be one of the eligible versions."
+    rationale = content["rationale"]
+    if not isinstance(rationale, str) or not 1 <= len(rationale) <= 2000:
+        return "Selection rationale must be a string of 1..2000 characters."
+    return None
+
+
+def _repair_violation(content: dict) -> str | None:
+    """Name the first violated repair JSON schema check, if any.
+
+    Semantic validation (allow-list membership, hash match, line caps) belongs to the
+    worker's edits.validate_edits; only the schema-level constraints are checked here.
+    """
+    summary = content.get("summary")
+    if not isinstance(summary, str) or not 1 <= len(summary) <= 2000:
+        return "Repair summary must be a string of 1..2000 characters."
+    edits = content.get("edits")
+    if not isinstance(edits, list) or not 1 <= len(edits) <= 5:
+        return "Repair edits must be a list of 1..5 edit objects."
+    for index, edit in enumerate(edits, start=1):
+        if not isinstance(edit, dict) or set(edit) != {"path", "original_sha256", "replacement_text"}:
+            return (
+                f"Repair edit {index} must have exactly the keys path, original_sha256, "
+                "and replacement_text."
+            )
+        if not isinstance(edit["path"], str) or not 1 <= len(edit["path"]) <= 200:
+            return f"Repair edit {index} path must be a string of 1..200 characters."
+        digest = edit["original_sha256"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            return f"Repair edit {index} original_sha256 must be a 64-character hexadecimal string."
+        replacement = edit["replacement_text"]
+        if not isinstance(replacement, str) or not 1 <= len(replacement) <= 262144:
+            return f"Repair edit {index} replacement_text must be a string of 1..262144 characters."
+    return None
+
+
+def _require_model_id(settings: Settings) -> str:
+    """Resolve the model id; the internal endpoints treat a missing one as unavailable."""
+    try:
+        return settings.require_model_id()
+    except ValueError:
+        raise ApiError(502, "inference_unavailable", "model id not configured") from None
+
+
+def _structured_content(result: StructuredResult) -> dict:
+    """Unwrap a StructuredResult or map its failure to 502 inference_unavailable."""
+    if not result.ok or not isinstance(result.content, dict):
+        detail = str(result.error or "structured response invalid after one correction retry")[:500]
+        raise ApiError(502, "inference_unavailable", detail)
+    return result.content
+
+
+def _default_inference_factory(settings: Settings) -> VultrInferenceClient:
+    """Build a fresh Vultr client per request; the endpoint closes it after the call."""
+    return VultrInferenceClient(settings)
 
 
 def _default_port(scheme: str) -> int | None:
@@ -318,6 +446,106 @@ def _register_routes(application: FastAPI, runtime: Callable[[], tuple[Settings,
             headers={"Content-Disposition": f'attachment; filename="{name}"'},
         )
 
+    def internal_authorization(x_internal_token: Annotated[str | None, Header()] = None) -> None:
+        """Require the configured shared internal token; open when none is configured."""
+        settings, _store = runtime()
+        expected = settings.internal_token
+        if expected is None:
+            return
+        supplied = x_internal_token or ""
+        if not supplied or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+            raise ApiError(
+                401,
+                "unauthorized",
+                "Send the configured shared token in the 'X-Internal-Token' header.",
+            )
+
+    def structured_call(settings: Settings, messages: list[dict[str, str]], *, max_tokens: int) -> StructuredResult:
+        """Run one structured inference call and close the client when it owns one."""
+        factory = getattr(application.state, "inference_factory", None) or _default_inference_factory
+        client = factory(settings)
+        try:
+            return client.chat_completion_structured(
+                messages, max_tokens=max_tokens, correction_prompt=_STRUCTURED_CORRECTION_PROMPT)
+        finally:
+            closer = getattr(client, "close", None)
+            if callable(closer):
+                closer()
+
+    @application.post("/internal/inference/select")
+    def select_inference(
+        request: SelectRequest,
+        _token_ok: Annotated[None, Depends(internal_authorization)],
+    ) -> dict:
+        """Pick one eligible target version with a structured inference call."""
+        settings, _store = runtime()
+        model_id = _require_model_id(settings)
+        messages = [
+            {"role": "system", "content": _SELECT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Package: {request.package}\n"
+                    f"Eligible target versions: {json.dumps(request.eligible_versions)}\n"
+                    f"Repository context (bounded):\n{request.context}"
+                ),
+            },
+        ]
+        try:
+            result = structured_call(settings, messages, max_tokens=512)
+        except (InferenceError, ValueError) as exc:
+            raise ApiError(502, "inference_unavailable", str(exc)[:500]) from None
+        content = _structured_content(result)
+        violation = _selection_violation(content, request.package, request.eligible_versions)
+        if violation is not None:
+            raise ApiError(422, "invalid_selection", violation)
+        return {
+            "selection": {
+                "package": content["package"],
+                "target_version": content["target_version"],
+                "rationale": content["rationale"],
+            },
+            "model_id": model_id,
+            "attempts": result.attempts,
+            "usage": result.usage,
+        }
+
+    @application.post("/internal/inference/repair")
+    def repair_inference(
+        request: RepairRequest,
+        _token_ok: Annotated[None, Depends(internal_authorization)],
+    ) -> dict:
+        """Propose bounded source edits for one failing upgrade via structured inference."""
+        settings, _store = runtime()
+        model_id = _require_model_id(settings)
+        sections = [
+            f"Package: {request.package}",
+            f"Target version: {request.target_version}",
+            f"Failure context:\n{request.failure_context}",
+        ]
+        for item in request.file_contexts:
+            digest = hashlib.sha256(item.content.encode("utf-8")).hexdigest()
+            sections.append(f"File: {item.path}\nCurrent sha256: {digest}\nContent:\n{item.content}")
+        sections.append(f"Allowed paths: {json.dumps(request.allowed_paths)}")
+        messages = [
+            {"role": "system", "content": _REPAIR_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(sections)},
+        ]
+        try:
+            result = structured_call(settings, messages, max_tokens=4096)
+        except (InferenceError, ValueError) as exc:
+            raise ApiError(502, "inference_unavailable", str(exc)[:500]) from None
+        content = _structured_content(result)
+        violation = _repair_violation(content)
+        if violation is not None:
+            raise ApiError(422, "invalid_repair", violation)
+        return {
+            "repair": {"summary": content["summary"], "edits": content["edits"]},
+            "model_id": model_id,
+            "attempts": result.attempts,
+            "usage": result.usage,
+        }
+
 
 _module_runtime_pair: tuple[Settings, Store] | None = None
 
@@ -359,9 +587,21 @@ async def _module_lifespan(application: FastAPI):
         _module_runtime_pair = None
 
 
-def create_app(settings: Settings, store: Store) -> FastAPI:
-    """Build a fully configured application instance for the given settings and store."""
+def create_app(
+    settings: Settings,
+    store: Store,
+    *,
+    inference_factory: Callable[[Settings], Any] | None = None,
+) -> FastAPI:
+    """Build a fully configured application instance for the given settings and store.
+
+    ``inference_factory`` builds the per-request structured inference client from the
+    settings; it defaults to constructing a VultrInferenceClient lazily per request.
+    Tests inject a stub here. The factory is stored on the app state and used by the
+    /internal inference endpoints.
+    """
     application = FastAPI(title="Upgrade Chamber")
+    application.state.inference_factory = inference_factory
     _register_routes(application, lambda: (settings, store))
     return application
 

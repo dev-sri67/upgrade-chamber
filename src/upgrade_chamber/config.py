@@ -9,10 +9,21 @@ NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1,
 
 
 class Settings(BaseSettings):
+    """Controller settings sourced from the process environment.
+
+    ``internal_token`` guards the /internal inference endpoints: production
+    sets INTERNAL_TOKEN in both api.env and worker.env, while local tests
+    leave it unset so those endpoints stay open.
+    """
+
     model_config = SettingsConfigDict(extra="ignore", frozen=True)
 
     vultr_inference_api_key: SecretStr | None = None
     vultr_model_id: NonBlank | None = None
+    # Shared secret for the /internal inference endpoints; production sets
+    # INTERNAL_TOKEN in both api.env and worker.env. Unset (local tests) keeps
+    # the internal endpoints open.
+    internal_token: NonBlank | None = None
 
     # Worker execution paths, identity, and operational limits for the job queue.
     database_path: str | None = None
