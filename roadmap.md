@@ -1,13 +1,29 @@
 # Upgrade Chamber — 24-Hour Roadmap
 
-Status: planned. No milestone is complete until its acceptance evidence exists.
+Status: implementation in progress as of 2026-09-26. Gates remain open until their acceptance evidence exists.
 Scope authority: [mission.md](mission.md). Architecture and limits: [tech-stack.md](tech-stack.md).
+
+## Current position and remaining work
+
+The [public repository](https://github.com/dev-sri67/upgrade-chamber) is pushed. The Vultr VM at `45.76.66.244` runs the API with a healthy `GET /healthz` response on `localhost:8000`. Project source was uploaded to the VM with approval. The API runs under a nonprivileged `upgrade-chamber` account without Docker group membership. A real Vultr Serverless Inference structured-response smoke call passed using `glm-5.3-flash`. The official digest-pinned Python 3.11 runner image was built on Vultr, verified as Python 3.11.16, and inspected with local image ID `sha256:9eca30cba682f2aa74df8892a1b2ddccad12438628e41aefcc541f49ac80acab`.
+
+The fixed runner, preparation code, historical research profile, and operator experiment driver exist. The latest local full suite passed 43 tests with one Starlette warning; its fake Docker tests do not prove live containment or repository compatibility. The historical profile remains disabled. The first live experiment stopped during input staging for the timeout probe: Docker 29.8.1 rejected `put_archive` because the container root filesystem is read-only, despite the `/work` tmpfs. That container was removed. No timeout outcome, recovery probe, preparation, baseline, or candidate result was recorded. Input staging needs a policy-preserving fix and live rerun. Neither G1 nor G2 is complete. See [acceptance tracking](docs/implementation-checklist.md) and [operator handoff](docs/RESUME.md) for stage evidence.
+
+Complete the remaining work in this order:
+
+1. Fix read-only-root input staging while preserving the execution policy, then rerun the live experiment. Inspect timeout removal and follow-up success, preparation artifacts, installed versions, source/image identities, collected test IDs, JUnit reports, and baseline/candidate outcomes. Record failures as observed; do not enable a profile on synthetic evidence. If the historical case fails the feasibility gate, use the labeled reference-fixture fallback below.
+2. Run the memory-limit probe and complete G2 live containment evidence, including cleanup after normal and failing execution. Fix any failed policy or lifecycle check before opening public execution.
+3. Implement SQLite run, attempt, event, and artifact records; serial job orchestration; protected-edit and test-collection checks; independent verifier; patch/evidence export; OSV status; and authenticated run, status, cancel, and artifact API endpoints. Exercise cancellation and baseline-failure paths.
+4. Add the bounded Vultr model selection and repair loop. Verify actual model attempts with fresh containers, then enable only a profile whose live evidence satisfies admission checks.
+5. Build the browser workflow and public HTTPS deployment. Run a fresh browser job, complete M01–M12 end-to-end checks, record containment/recovery and demo video, then verify public links for submission.
+
+The hour ranges and gate hours below preserve the original **24-hour planning estimates**. They are not elapsed-time claims, current deadlines, or evidence that a gate passed.
 
 ## Delivery strategy
 
 Build one complete, reproducible workflow before adding repository coverage or UI decoration. The first risk is a usable baseline and upgrade case. The second is bounded sandbox execution. The third is model repair reliability. Deployment begins early; the last four hours are reserved for validation and submission.
 
-This is a 24-hour elapsed schedule for one experienced builder. If teammates are available, work can be divided across runner, web UI, and deployment once contracts are agreed, without increasing the feature set. Do not require a multi-agent runtime.
+This was estimated as a 24-hour elapsed schedule for one experienced builder. If teammates are available, work can be divided across runner, web UI, and deployment once contracts are agreed, without increasing the feature set. Do not require a multi-agent runtime.
 
 ## Hours 0–3: Prove feasibility
 
