@@ -4,8 +4,9 @@ Each pass the worker requeues stale leases, leases one queued run, and drives
 it through the fixed phase machine while persisting every state change before
 the event that describes it. Model involvement is bounded: a single internal
 inference endpoint confirms the profile-fixed selection, and at most two
-validated repairs may follow a failing candidate attempt. Evidence artifacts
-are written before the terminal update so the manifest can hash the complete
+bounded agent repair sessions may follow a failing candidate attempt, each
+one a fixed-turn tool loop executed controller-side. Evidence artifacts are
+written before the terminal update so the manifest can hash the complete
 bundle except for itself, which is accepted as unhashable.
 """
 
@@ -18,19 +19,16 @@ import re
 import signal
 import tarfile
 import time
-import xml.etree.ElementTree as ElementTree
-import zipfile
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from upgrade_chamber import edits
+from upgrade_chamber.agent import AgentSession
 from upgrade_chamber.config import Settings
 from upgrade_chamber.edits import (
-    ALLOWED_EDIT_PATHS,
     EditValidationError,
     changed_file_diffs,
     load_source_zip,
-    member_name,
 )
 from upgrade_chamber.osv import query_osv
 from upgrade_chamber.runner import DockerRunner
@@ -70,19 +68,12 @@ MANIFEST_LIMITATIONS = (
     "absence of vulnerabilities."
 )
 MAX_REPAIRS = 2
-MAX_INFERENCE_CALLS = 6
+MAX_INFERENCE_CALLS = 18
 INTERNAL_RESPONSE_LIMIT = 1024 * 1024
 INFERENCE_ERROR_MESSAGE_LIMIT = 500
 INFERENCE_TIMEOUT_SECONDS = 60.0
-LOG_TAIL_LIMIT = 8000
-JUNIT_SUMMARY_LIMIT = 4000
-FAILURE_CONTEXT_LIMIT = 12000
-FILE_CONTEXT_LIMIT = 12000
 RECORD_LIMIT = 2000
-LOG_TAIL_MARKER = "[log tail, truncated to the last 8000 characters]\n"
-JUNIT_SUMMARY_MARKER = "[junit failure summaries, truncated to the first 4000 characters]\n"
-FAILURE_CONTEXT_MARKER = "[failure context truncated to the last 12000 characters]\n"
-FILE_CONTEXT_MARKER = "[file context truncated to the last 12000 characters]\n"
+TURN_DETAIL_LIMIT = 300
 
 
 class InternalInferenceError(RuntimeError):
@@ -110,86 +101,6 @@ def _error_body(data: Any, status: Any) -> tuple[str, str]:
             return code, message[:INFERENCE_ERROR_MESSAGE_LIMIT]
     label = f"http_{status}" if isinstance(status, int) else "invalid_response"
     return label, "internal inference request failed"
-
-
-def _bounded_tail(text: str, limit: int, marker: str) -> str:
-    """Return the last `limit` characters, prepending the marker when cut."""
-    if len(text) <= limit:
-        return text
-    keep = limit - len(marker)
-    return marker + text[-keep:] if keep > 0 else marker
-
-
-def _bounded_head(text: str, limit: int, marker: str) -> str:
-    """Return the first `limit` characters, prepending the marker when cut."""
-    if len(text) <= limit:
-        return text
-    return marker + text[: limit - len(marker)]
-
-
-def _junit_failure_names(content: bytes) -> list[str]:
-    """Collect the node names of failing or errored testcases in one junit file."""
-    try:
-        root = ElementTree.fromstring(content)
-    except ElementTree.ParseError:
-        return []
-    names = []
-    for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "testcase":
-            continue
-        if not any(child.tag.rsplit("}", 1)[-1] in {"failure", "error"} for child in element):
-            continue
-        classname = element.get("classname") or ""
-        name = element.get("name") or ""
-        names.append(f"{classname}::{name}" if classname else name)
-    return names
-
-
-def _junit_failure_summary(content: bytes | None) -> str:
-    """Bounded text listing the first failing test names, or empty text."""
-    if content is None:
-        return ""
-    names = _junit_failure_names(content)
-    if not names:
-        return ""
-    text = "\n".join(f"failing test: {name}" for name in names)
-    return _bounded_head(text, JUNIT_SUMMARY_LIMIT, JUNIT_SUMMARY_MARKER)
-
-
-def _failure_context(artifacts: dict[str, bytes]) -> str:
-    """Build the bounded failure context from one failed attempt's artifacts.
-
-    Uses the test.log tail and, when present, the junit.xml failure summaries.
-    Every truncation is explicit with a marker line.
-    """
-    log = artifacts.get("test.log")
-    if log is None:
-        log_section = "(test.log is missing from the failed attempt artifacts)\n"
-    else:
-        log_section = _bounded_tail(
-            log.decode("utf-8", errors="replace"), LOG_TAIL_LIMIT, LOG_TAIL_MARKER)
-    junit_section = _junit_failure_summary(artifacts.get("junit.xml"))
-    context = log_section + (f"\n{junit_section}" if junit_section else "")
-    return _bounded_tail(context, FAILURE_CONTEXT_LIMIT, FAILURE_CONTEXT_MARKER)
-
-
-def _file_contexts(source_zip: bytes) -> list[dict[str, str]]:
-    """Build bounded file contexts from the allowed paths present in the zip."""
-    contexts = []
-    with zipfile.ZipFile(io.BytesIO(source_zip)) as archive:
-        present = set(archive.namelist())
-        for path in ALLOWED_EDIT_PATHS:
-            name = member_name(path)
-            if name not in present:
-                continue
-            content = archive.read(name).decode("utf-8", errors="replace")
-            contexts.append({
-                "path": path,
-                "content": _bounded_tail(content, FILE_CONTEXT_LIMIT, FILE_CONTEXT_MARKER),
-            })
-    if not contexts:
-        raise EditValidationError("No allowed edit paths are present in the source zip")
-    return contexts
 
 
 def _utc_now() -> str:
@@ -316,6 +227,7 @@ class Worker:
         self._http_client = http_client
         self._max_inference_calls = max_inference_calls
         self._inference_calls = 0
+        self._agent_model_id: str | None = None
 
     def _internal_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """POST one JSON payload to an internal inference endpoint.
@@ -359,6 +271,22 @@ class Worker:
             raise InternalInferenceError(
                 "invalid_response", "Internal inference response is not a JSON object")
         return data
+
+    def _agent_model_call(self, run_id: int, messages: list[dict[str, str]]) -> dict[str, Any]:
+        """POST one agent conversation turn to the internal inference endpoint.
+
+        Sends the full worker-owned conversation with the fixed 4096 token
+        cap and returns the trimmed {"message", "usage"} pair the agent
+        session consumes. The latest response model_id is recorded on
+        ``self._agent_model_id`` so run evidence can name the model.
+        """
+        response = self._internal_post("/internal/inference/agent-turn", {
+            "run_id": run_id,
+            "messages": messages,
+            "max_tokens": 4096,
+        })
+        self._agent_model_id = response.get("model_id")
+        return {"message": response["message"], "usage": response["usage"]}
 
     def run_forever(self, should_stop: Callable[[], bool]) -> None:
         """Lease and execute runs until should_stop() turns true."""
@@ -629,26 +557,27 @@ class Worker:
         if candidate.status == "passed":
             pass
         elif candidate.status == "test_failed":
-            try:
-                current_zip = load_source_zip(current_tar)
-            except EditValidationError as exc:
-                finalize(
-                    "upgrade_failed",
-                    f"test_failed: {_result_error(candidate)}; repair context unavailable: {exc}",
-                )
-                return
+
+            def budgeted_model_call(messages: list[dict[str, str]]) -> dict[str, Any]:
+                """Run one agent model call under the job-wide inference budget."""
+                self._inference_calls += 1
+                if self._inference_calls > self._max_inference_calls:
+                    raise InternalInferenceError(
+                        "budget_exhausted", "per-job inference call budget exhausted")
+                response = self._agent_model_call(run_id, messages)
+                if isinstance(self._agent_model_id, str) and self._agent_model_id:
+                    model_state["model_id"] = self._agent_model_id
+                return response
+
             latest_failure: Any = candidate
             for repair_number in range(1, MAX_REPAIRS + 1):
                 stop = pre_phase_stop()
                 if stop is not None:
                     finalize(*stop)
                     return
-                if self._inference_calls >= self._max_inference_calls:
-                    break
                 self._transition(run_id, "repairing", attempt=repair_number)
                 try:
-                    failure_context = _failure_context(latest_failure.artifacts)
-                    file_contexts = _file_contexts(current_zip)
+                    source_zip = load_source_zip(current_tar)
                 except EditValidationError as exc:
                     finalize(
                         "upgrade_failed",
@@ -656,16 +585,18 @@ class Worker:
                         f" repair context unavailable: {exc}",
                     )
                     return
-                self._inference_calls += 1
+                log_bytes = latest_failure.artifacts.get("test.log")
+                test_log = (
+                    log_bytes.decode("utf-8", errors="replace")
+                    if log_bytes is not None else None
+                )
+                session = AgentSession(
+                    source_zip=source_zip,
+                    test_log=test_log,
+                    model_call=budgeted_model_call,
+                )
                 try:
-                    repair_result = self._internal_post("/internal/inference/repair", {
-                        "run_id": run_id,
-                        "package": run["dependency"],
-                        "target_version": run["target_version"],
-                        "failure_context": failure_context,
-                        "file_contexts": file_contexts,
-                        "allowed_paths": list(ALLOWED_EDIT_PATHS),
-                    })
+                    session_result = session.run()
                 except InternalInferenceError as exc:
                     provider_note = (exc.code, exc.message)
                     self._store.append_event(run_id, "repair", {
@@ -675,57 +606,62 @@ class Worker:
                         "message": exc.message,
                     })
                     break
-                repair = repair_result.get("repair")
-                summary = repair.get("summary") if isinstance(repair, dict) else None
-                if not isinstance(summary, str):
-                    summary = ""
-                summary = summary[:RECORD_LIMIT]
-                proposed = repair.get("edits") if isinstance(repair, dict) else None
-                edit_paths = [
-                    item["path"] for item in proposed
-                    if isinstance(item, dict) and isinstance(item.get("path"), str)
-                ] if isinstance(proposed, list) else []
-                model_state["model_id"] = repair_result.get("model_id")
+                summary = (session_result.summary or "")[:RECORD_LIMIT]
+                self._store.append_event(run_id, "repair", {
+                    "attempt": repair_number,
+                    "status": session_result.status,
+                    "summary": summary,
+                    "turns": [
+                        {"tool": turn.tool, "ok": turn.ok,
+                         "detail": turn.detail[:TURN_DETAIL_LIMIT]}
+                        for turn in session_result.turns
+                    ],
+                    "model_calls": session_result.model_calls,
+                    "usage": session_result.usage,
+                    "edit_paths": [edit["path"] for edit in session_result.edits],
+                })
+                if session_result.status == "aborted":
+                    finalize("upgrade_failed", f"repair session aborted: {summary}")
+                    return
+                if session_result.status in ("exhausted", "invalid"):
+                    finalize("upgrade_failed", f"repair session {session_result.status}")
+                    return
+                if session_result.status != "finished" or not session_result.edits:
+                    # validate_edits rejects empty edit lists, so a finished
+                    # session always carries edits; guard the contract honestly.
+                    finalize(
+                        "upgrade_failed",
+                        f"repair session {session_result.status}:"
+                        " no validated edits to apply",
+                    )
+                    return
                 model_state["repair_count"] = repair_number
                 record = {
                     "attempt": repair_number,
+                    "status": session_result.status,
                     "summary": summary,
-                    "status": "proposed",
-                    "edit_paths": edit_paths,
+                    "edit_paths": [edit["path"] for edit in session_result.edits],
+                    "model_calls": session_result.model_calls,
+                    "usage": session_result.usage,
                 }
                 repair_records.append(record)
-                manifest_repairs.append({"attempt": repair_number, "summary": summary})
-                self._store.append_event(run_id, "repair", {
+                manifest_repairs.append({
                     "attempt": repair_number,
-                    "status": "proposed",
+                    "status": session_result.status,
                     "summary": summary,
-                    "edit_paths": edit_paths,
-                    "model_id": repair_result.get("model_id"),
-                    "attempts": repair_result.get("attempts"),
-                    "usage": repair_result.get("usage"),
+                    "model_calls": session_result.model_calls,
                 })
                 try:
-                    validated = edits.validate_edits(current_zip, proposed)
-                except EditValidationError as exc:
-                    record["status"] = "rejected"
-                    self._store.append_event(run_id, "repair", {
-                        "attempt": repair_number,
-                        "status": "rejected",
-                        "reason": str(exc)[:RECORD_LIMIT],
-                    })
-                    continue
-                try:
-                    new_zip, new_sha = edits.apply_edits(current_zip, validated)
+                    new_zip, new_sha = edits.apply_edits(source_zip, session_result.edits)
                     new_tar = edits.rebuild_candidate_tar(current_tar, new_zip, new_sha)
                 except (EditValidationError, RuntimeError, tarfile.TarError) as exc:
                     finalize(
                         "upgrade_failed",
                         f"test_failed: {_result_error(latest_failure)};"
-                        f" repair application failed: {exc}",
+                        f" repair application failed: {type(exc).__name__}: {exc}",
                     )
                     return
-                repair_chain.append((repair_number, current_zip, new_zip))
-                current_zip = new_zip
+                repair_chain.append((repair_number, source_zip, new_zip))
                 current_tar = new_tar
                 self._transition(run_id, "upgrading")
                 attempt_result, attempt_started, attempt_finished = invoke(
