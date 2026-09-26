@@ -1,13 +1,16 @@
 """Worker phase-machine checks against a real store and a programmable fake runner."""
 
+import hashlib
 import io
 import json
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+from upgrade_chamber.edits import ALLOWED_EDIT_PATHS, member_name
 from upgrade_chamber.runner import AttemptResult, PreparationResult
 from upgrade_chamber.storage import Store
 from upgrade_chamber.worker import Worker
@@ -17,6 +20,28 @@ IMAGE = "python-runner@sha256:" + "b" * 64
 RUNNER_SOURCE_DIGEST = "c" * 64
 METADATA_SOURCE_DIGEST = "d" * 64
 BASELINE_IDS = [f"tests/test_example.py::test_{index}" for index in range(5)]
+MODEL_ID = "vultr-test-model"
+ADAPTERS_PATH = "requests_unixsocket/adapters.py"
+ADAPTERS_ORIGINAL = "HTTPAdapter = object\nUNIXSocketAdapter = object\n"
+ADAPTERS_REPAIRED = "HTTPAdapter = object\nUNIXSocketAdapter = object  # repaired\n"
+REPAIR_FILES = {
+    "requests_unixsocket/__init__.py": "from . import adapters\n",
+    ADAPTERS_PATH: ADAPTERS_ORIGINAL,
+    "setup.py": "from setuptools import setup\nsetup()\n",
+}
+FAILURE_LOG = (
+    b"collected 5 items\n"
+    b"tests/test_example.py::test_0 FAILED socket path changed\n"
+    b"1 failed, 4 passed\n"
+)
+JUNIT_WITH_FAILURE = (
+    b'<?xml version="1.0" encoding="utf-8"?>\n'
+    b'<testsuite tests="2" failures="1" errors="0">\n'
+    b'<testcase classname="tests.test_example" name="test_0">'
+    b'<failure message="boom">traceback</failure></testcase>\n'
+    b'<testcase classname="tests.test_example" name="test_1"/>\n'
+    b"</testsuite>\n"
+)
 ATTEMPT_ARTIFACT_NAMES = (
     "attempt.json",
     "collect.txt",
@@ -52,6 +77,123 @@ def requirements_bundle(content: bytes) -> bytes:
         info.size = len(content)
         archive.addfile(info, io.BytesIO(content))
     return output.getvalue()
+
+
+def _tar_bytes(members: list[tuple[str, bytes]]) -> bytes:
+    """Build one uncompressed tar from (name, content) members."""
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        for name, content in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return output.getvalue()
+
+
+def sha256_text(text: str) -> str:
+    """SHA-256 of one UTF-8 text, matching the edit hash contract."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def repair_source_zip() -> bytes:
+    """Build a real small source.zip over the fixed edit-allowed files."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, text in REPAIR_FILES.items():
+            archive.writestr(
+                zipfile.ZipInfo(member_name(path), date_time=(1980, 1, 1, 0, 0, 0)),
+                text.encode("utf-8"),
+            )
+    return buffer.getvalue()
+
+
+def repair_candidate_tar(source: bytes) -> bytes:
+    """Build a valid candidate attempt input tar around one source.zip."""
+    manifest = {
+        "schema_version": 1,
+        "phase": "candidate",
+        "source_sha256": hashlib.sha256(source).hexdigest(),
+    }
+    return _tar_bytes([
+        ("source.zip", source),
+        ("requirements.txt", b"requests==2.32.2\n"),
+        ("manifest.json", (json.dumps(manifest, indent=2) + "\n").encode("utf-8")),
+        ("wheels/requests.whl", b"wheel"),
+    ])
+
+
+def adapters_edit(*, digest: str | None = None,
+                  replacement: str = ADAPTERS_REPAIRED) -> dict:
+    """Build one adapters.py edit; a wrong digest forces semantic rejection."""
+    return {
+        "path": ADAPTERS_PATH,
+        "original_sha256": digest or sha256_text(ADAPTERS_ORIGINAL),
+        "replacement_text": replacement,
+    }
+
+
+def selection_response(*, target: str = "2.32.2", model_id: str = MODEL_ID) -> tuple[int, bytes]:
+    """Canned 200 body for the internal select endpoint."""
+    body = {
+        "selection": {
+            "package": "requests",
+            "target_version": target,
+            "rationale": "target version fixed by the validated profile",
+        },
+        "model_id": model_id,
+        "attempts": 1,
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+    }
+    return (200, json.dumps(body).encode("utf-8"))
+
+
+def repair_response(edits: list[dict], *, summary: str = "adjust adapter compatibility",
+                    model_id: str = MODEL_ID) -> tuple[int, bytes]:
+    """Canned 200 body for the internal repair endpoint."""
+    body = {
+        "repair": {"summary": summary, "edits": edits},
+        "model_id": model_id,
+        "attempts": 1,
+        "usage": {"prompt_tokens": 21, "completion_tokens": 9},
+    }
+    return (200, json.dumps(body).encode("utf-8"))
+
+
+def error_response(code: str, message: str,
+                   status: int = 502) -> tuple[int, bytes]:
+    """Canned error body shaped like the frozen internal error contract."""
+    return (status, json.dumps({"error": {"code": code, "message": message}}).encode("utf-8"))
+
+
+class FakeInternalResponse:
+    """Minimal httpx-like response carrying only status and body bytes."""
+
+    def __init__(self, status_code: int, content: bytes) -> None:
+        self.status_code = status_code
+        self.content = content
+
+
+class FakeInternalClient:
+    """Stub HTTP client recording internal POSTs and returning canned responses.
+
+    Each scripted entry is either an exception to raise or a
+    (status, body-bytes) pair. Exhausting the script fails the call loudly so
+    tests prove exactly how many internal POSTs the worker made.
+    """
+
+    def __init__(self, responses: list) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._responses = list(responses)
+
+    def post(self, url: str, *, json: Any = None, headers: Any = None) -> FakeInternalResponse:
+        self.calls.append({"url": url, "payload": json, "headers": headers})
+        if not self._responses:
+            raise AssertionError(f"unexpected internal inference POST: {url}")
+        entry = self._responses.pop(0)
+        if isinstance(entry, Exception):
+            raise entry
+        status, content = entry
+        return FakeInternalResponse(status, content)
 
 
 def attempt_marker(phase: str, status: str, *, ids=None, installed=None, error=None) -> dict:
@@ -108,9 +250,26 @@ def attempt_result(phase: str, status: str = "passed", *, ids=None, installed=No
     )
 
 
+def failing_candidate(*, error: str = "1 test failed", log: bytes = FAILURE_LOG,
+                      junit: bytes | None = JUNIT_WITH_FAILURE,
+                      ids: list[str] | None = None) -> AttemptResult:
+    """Build one candidate test_failed result carrying real log and junit bytes."""
+    result = attempt_result(
+        "candidate", status="test_failed",
+        ids=list(BASELINE_IDS) if ids is None else ids, error=error)
+    result.artifacts["test.log"] = log
+    if junit is not None:
+        result.artifacts["junit.xml"] = junit
+    return result
+
+
 def preparation_result(status: str = "prepared", *, error=None,
-                       source_digest=None) -> PreparationResult:
-    """Build one PreparationResult carrying both pinned offline bundles."""
+                       source_digest=None, candidate: bytes | None = None) -> PreparationResult:
+    """Build one PreparationResult carrying both pinned offline bundles.
+
+    ``candidate`` replaces the default requirements-only candidate.tar with a
+    full attempt input tar (used by the repair-loop tests).
+    """
     marker = {
         "schema_version": 1,
         "status": status,
@@ -124,7 +283,7 @@ def preparation_result(status: str = "prepared", *, error=None,
             "baseline-metadata.json": json.dumps(metadata).encode(),
             "candidate-metadata.json": b"{}",
             "baseline.tar": requirements_bundle(b"requests==2.31.0\n"),
-            "candidate.tar": requirements_bundle(b"requests==2.32.2\n"),
+            "candidate.tar": candidate or requirements_bundle(b"requests==2.32.2\n"),
         })
     return PreparationResult(
         status=status,
@@ -193,8 +352,9 @@ class FakeRunner:
         return self._preparation
 
     def run_profile_attempt(self, input_tar: bytes, *, phase: str,
-                            timeout_seconds=300.0, should_cancel=None) -> AttemptResult:
-        self.calls.append((phase, timeout_seconds))
+                            timeout_seconds: float = 300.0,
+                            should_cancel: Callable[[], bool] | None = None) -> AttemptResult:
+        self.calls.append((phase, timeout_seconds, input_tar))
         hook = self._hooks.get(phase)
         if hook is not None:
             hook()
@@ -214,11 +374,16 @@ class WorkerTests(unittest.TestCase):
         self.store = Store(base / "runs.db", base / "artifacts")
         self.addCleanup(self.store.close)
 
-    def execute(self, runner: FakeRunner, osv_query=fake_osv) -> int:
+    def execute(self, runner: FakeRunner, osv_query=fake_osv, *,
+                internal: FakeInternalClient | None = None,
+                **worker_kwargs: Any) -> int:
         """Create, lease, and execute one run; return its id."""
+        if internal is None:
+            internal = FakeInternalClient([selection_response()])
         run_id, _ = self.store.create_run(**RUN_PARAMS)
         run = self.store.lease_next_run("test-worker", 1000.0)
-        Worker(self.store, runner, osv_query=osv_query).execute_run(run)
+        Worker(self.store, runner, osv_query=osv_query,
+               http_client=internal, **worker_kwargs).execute_run(run)
         return run_id
 
     def artifact_names(self, run_id: int) -> set[str]:
@@ -297,7 +462,9 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual({event["kind"] for event in events},
                          {"state", "attempt", "artifact", "selection", "advisory", "terminal"})
         selection = [event for event in events if event["kind"] == "selection"]
-        self.assertEqual(selection[0]["data"]["source"], "profile")
+        self.assertEqual(selection[0]["data"]["source"], "model")
+        self.assertEqual(selection[0]["data"]["model_id"], MODEL_ID)
+        self.assertEqual(selection[0]["data"]["target_version"], "2.32.2")
         terminal = [event for event in events if event["kind"] == "terminal"][-1]
         self.assertEqual(terminal["data"]["state"], "completed")
         self.assertEqual(terminal["data"]["cleanup_state"], "observed")
@@ -327,12 +494,13 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse([event for event in events if event["kind"] == "selection"])
 
     def test_candidate_test_failure_produces_evidence_without_verifier(self):
+        # With the inference budget spent by the selection call, the repair
+        # loop must refuse to run and the honest candidate failure stands.
         runner = FakeRunner(
             preparation_result(),
             [attempt_result("baseline", installed="2.31.0"),
-             attempt_result("candidate", status="test_failed", ids=list(BASELINE_IDS),
-                            error="1 test failed", complete=False)])
-        run_id = self.execute(runner)
+             failing_candidate()])
+        run_id = self.execute(runner, max_inference_calls=1)
 
         run = self.store.get_run(run_id)
         self.assertEqual(run["state"], "upgrade_failed")
@@ -347,6 +515,12 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(comparison["candidate"]["status"], "test_failed")
         self.assertIsNone(comparison["verifier"])
         self.assertTrue(comparison["collected_ids_match"])
+        events = self.store.events_after(run_id, 0)
+        self.assertFalse([event for event in events if event["kind"] == "repair"])
+        self.assertFalse([event for event in events if event["kind"] == "state"
+                          and event["data"].get("state") == "repairing"])
+        result_payload = json.loads(run["result"])
+        self.assertEqual(result_payload["model"], {"model_id": MODEL_ID, "repair_count": 0})
 
     def test_candidate_changed_ids_fail_protected_scope_before_verifier(self):
         changed = ["tests/test_other.py::test_renamed"] + BASELINE_IDS[:4]
@@ -363,6 +537,308 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(phases, ["preparation", "baseline", "candidate"])
         self.assertEqual([call[0] for call in runner.calls],
                          ["preparation", "baseline", "candidate"])
+
+    # --- model selection and the bounded repair loop ---
+
+    def test_model_selection_uses_internal_endpoint(self):
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        internal = FakeInternalClient([selection_response()])
+        run_id = self.execute(runner, internal=internal)
+
+        self.assertEqual(self.store.get_run(run_id)["state"], "completed")
+        self.assertEqual(len(internal.calls), 1)
+        call = internal.calls[0]
+        self.assertTrue(call["url"].endswith("/internal/inference/select"))
+        payload = call["payload"]
+        self.assertEqual(set(payload), {"run_id", "package", "eligible_versions", "context"})
+        self.assertEqual(payload["package"], "requests")
+        self.assertEqual(payload["eligible_versions"], ["2.32.2"])
+        self.assertIn("https://github.com/msabramo/requests-unixsocket", payload["context"])
+        self.assertIn("the baseline suite passes on the baseline version", payload["context"])
+        events = self.store.events_after(run_id, 0)
+        selection = [event for event in events if event["kind"] == "selection"][0]
+        self.assertEqual(selection["data"]["source"], "model")
+        self.assertEqual(selection["data"]["model_id"], MODEL_ID)
+        self.assertNotIn("repair", {event["kind"] for event in events})
+
+    def test_model_selection_provider_failure_is_terminal(self):
+        runner = FakeRunner(
+            preparation_result(),
+            [attempt_result("baseline", installed="2.31.0")])
+        internal = FakeInternalClient(
+            [error_response("inference_unavailable", "provider offline")])
+        run_id = self.execute(runner, internal=internal)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "infrastructure_failed")
+        self.assertEqual(
+            record["status_detail"],
+            "model selection failed: inference_unavailable: provider offline")
+        self.assertIsNotNone(record["terminal_utc"])
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline"])
+        names = self.artifact_names(run_id)
+        self.assertNotIn("patch.diff", names)
+        self.assertNotIn("manifest.json", names)
+        events = self.store.events_after(run_id, 0)
+        self.assertFalse([event for event in events if event["kind"] == "advisory"])
+
+    def test_repair_happy_path_records_model_evidence(self):
+        prepared = preparation_result(candidate=repair_candidate_tar(repair_source_zip()))
+        runner = FakeRunner(
+            prepared,
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        internal = FakeInternalClient([
+            selection_response(),
+            repair_response([adapters_edit()]),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        self.assertEqual(self.store.get_run(run_id)["state"], "completed")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(
+            phases, ["preparation", "baseline", "candidate", "repair-1", "verifier"])
+        self.assertEqual([call[0] for call in runner.calls],
+                         ["preparation", "baseline", "candidate", "candidate", "candidate"])
+        self.assertNotEqual(runner.calls[3][2], prepared.artifacts["candidate.tar"])
+        self.assertEqual(runner.calls[4][2], runner.calls[3][2])
+        names = self.artifact_names(run_id)
+        self.assertIn("repair1-test.log", names)
+
+        patch = self.store.get_artifact(run_id, "patch.diff")
+        self.assertIn(b"--- repair 1 source changes ---", patch)
+        self.assertIn(b"+UNIXSocketAdapter = object  # repaired", patch)
+        self.assertIn(b"2.31.0", patch)
+        self.assertIn(b"2.32.2", patch)
+
+        comparison = json.loads(self.store.get_artifact(run_id, "comparison.json"))
+        self.assertEqual(comparison["candidate"]["status"], "passed")
+        self.assertEqual(comparison["repairs"], [{
+            "attempt": 1,
+            "summary": "adjust adapter compatibility",
+            "status": "proposed",
+            "edit_paths": [ADAPTERS_PATH],
+        }])
+        self.assertTrue(comparison["collected_ids_match"])
+
+        manifest = json.loads(self.store.get_artifact(run_id, "manifest.json"))
+        self.assertEqual(
+            manifest["model"],
+            {"model_id": MODEL_ID,
+             "selection": {"rationale": "target version fixed by the validated profile"},
+             "repairs": [{"attempt": 1, "summary": "adjust adapter compatibility"}]})
+        self.assertEqual(
+            [attempt["phase"] for attempt in manifest["attempts"]],
+            ["preparation", "baseline", "candidate", "repair-1", "verifier"])
+
+        result_payload = json.loads(self.store.get_run(run_id)["result"])
+        self.assertEqual(
+            result_payload["model"], {"model_id": MODEL_ID, "repair_count": 1})
+
+        self.assertEqual(len(internal.calls), 2)
+        repair_call = internal.calls[1]
+        self.assertTrue(repair_call["url"].endswith("/internal/inference/repair"))
+        payload = repair_call["payload"]
+        self.assertEqual(
+            set(payload),
+            {"run_id", "package", "target_version", "failure_context",
+             "file_contexts", "allowed_paths"})
+        self.assertEqual(payload["allowed_paths"], list(ALLOWED_EDIT_PATHS))
+        self.assertIn("socket path changed", payload["failure_context"])
+        self.assertIn("tests.test_example::test_0", payload["failure_context"])
+        contexts = {item["path"]: item["content"] for item in payload["file_contexts"]}
+        self.assertEqual(set(contexts), set(REPAIR_FILES))
+        self.assertEqual(contexts[ADAPTERS_PATH], ADAPTERS_ORIGINAL)
+
+        events = self.store.events_after(run_id, 0)
+        repair_events = [event for event in events if event["kind"] == "repair"]
+        self.assertEqual(len(repair_events), 1)
+        data = repair_events[0]["data"]
+        self.assertEqual(data["status"], "proposed")
+        self.assertEqual(data["model_id"], MODEL_ID)
+        self.assertEqual(data["edit_paths"], [ADAPTERS_PATH])
+        self.assertEqual(data["usage"], {"prompt_tokens": 21, "completion_tokens": 9})
+
+    def test_repair_rejection_then_second_repair_succeeds(self):
+        # A rejected proposal consumes budget but runs no attempt, so the
+        # runner script holds one attempt fewer than the repair count.
+        runner = FakeRunner(
+            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        internal = FakeInternalClient([
+            selection_response(),
+            repair_response([adapters_edit(digest="0" * 64)], summary="first try"),
+            repair_response([adapters_edit()], summary="second try"),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        self.assertEqual(self.store.get_run(run_id)["state"], "completed")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(
+            phases,
+            ["preparation", "baseline", "candidate", "repair-2", "verifier"])
+        events = self.store.events_after(run_id, 0)
+        repair_events = [event for event in events if event["kind"] == "repair"]
+        self.assertEqual([event["data"]["status"] for event in repair_events],
+                         ["proposed", "rejected", "proposed"])
+        rejected = repair_events[1]["data"]
+        self.assertIn("does not match", rejected["reason"])
+        manifest = json.loads(self.store.get_artifact(run_id, "manifest.json"))
+        self.assertEqual(
+            [entry["summary"] for entry in manifest["model"]["repairs"]],
+            ["first try", "second try"])
+        patch = self.store.get_artifact(run_id, "patch.diff")
+        self.assertNotIn(b"--- repair 1 source changes ---", patch)
+        self.assertIn(b"--- repair 2 source changes ---", patch)
+
+    def test_both_repairs_fail_tests_is_honest_upgrade_failed(self):
+        runner = FakeRunner(
+            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             failing_candidate(error="still failing"),
+             failing_candidate(error="still failing again")])
+        internal = FakeInternalClient([
+            selection_response(),
+            repair_response([adapters_edit()], summary="first try"),
+            repair_response(
+                [adapters_edit(digest=sha256_text(ADAPTERS_REPAIRED),
+                               replacement=ADAPTERS_REPAIRED + "# tweak\n")],
+                summary="second try"),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "upgrade_failed")
+        self.assertIn("test_failed: still failing again", record["status_detail"])
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(
+            phases, ["preparation", "baseline", "candidate", "repair-1", "repair-2"])
+        self.assertNotIn("verifier", phases)
+        self.assertEqual([call[0] for call in runner.calls],
+                         ["preparation", "baseline", "candidate", "candidate", "candidate"])
+        events = self.store.events_after(run_id, 0)
+        repair_events = [event for event in events if event["kind"] == "repair"]
+        self.assertEqual([event["data"]["status"] for event in repair_events],
+                         ["proposed", "proposed"])
+        result_payload = json.loads(record["result"])
+        self.assertEqual(result_payload["model"]["repair_count"], 2)
+
+    def test_repair_provider_error_ends_loop_honestly(self):
+        runner = FakeRunner(
+            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate()])
+        internal = FakeInternalClient([
+            selection_response(),
+            error_response("inference_unavailable", "model offline"),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "upgrade_failed")
+        self.assertIn("test_failed:", record["status_detail"])
+        self.assertIn(
+            "repair loop ended on provider error: inference_unavailable: model offline",
+            record["status_detail"])
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline", "candidate"])
+        self.assertEqual(len(runner.calls), 3)
+        events = self.store.events_after(run_id, 0)
+        repair_events = [event for event in events if event["kind"] == "repair"]
+        self.assertEqual([event["data"]["status"] for event in repair_events],
+                         ["provider_error"])
+        self.assertEqual(repair_events[0]["data"]["error_code"], "inference_unavailable")
+
+    def test_inference_budget_refuses_second_repair(self):
+        runner = FakeRunner(
+            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             failing_candidate(error="still failing")])
+        internal = FakeInternalClient([
+            selection_response(),
+            repair_response([adapters_edit()]),
+        ])
+        run_id = self.execute(runner, internal=internal, max_inference_calls=2)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "upgrade_failed")
+        self.assertIn("test_failed: still failing", record["status_detail"])
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline", "candidate", "repair-1"])
+        self.assertEqual(len(internal.calls), 2)
+        events = self.store.events_after(run_id, 0)
+        repair_events = [event for event in events if event["kind"] == "repair"]
+        self.assertEqual([event["data"]["status"] for event in repair_events],
+                         ["proposed"])
+
+    def test_repaired_attempt_changed_ids_fail_protected_scope(self):
+        changed = ["tests/test_other.py::test_renamed"] + BASELINE_IDS[:4]
+        runner = FakeRunner(
+            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             attempt_result("candidate", installed="2.32.2", ids=changed)])
+        internal = FakeInternalClient([
+            selection_response(),
+            repair_response([adapters_edit()]),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "upgrade_failed")
+        self.assertEqual(record["status_detail"], "collected test IDs changed from baseline")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline", "candidate", "repair-1"])
+        self.assertEqual(len(internal.calls), 2)
+
+    def test_candidate_passes_directly_skips_repair_and_reuses_tar(self):
+        prepared = preparation_result()
+        runner = FakeRunner(
+            prepared,
+            [attempt_result("baseline", installed="2.31.0"),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        internal = FakeInternalClient([selection_response()])
+        run_id = self.execute(runner, internal=internal)
+
+        self.assertEqual(self.store.get_run(run_id)["state"], "completed")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(phases, ["preparation", "baseline", "candidate", "verifier"])
+        self.assertEqual(len(internal.calls), 1)
+        self.assertTrue(internal.calls[0]["url"].endswith("/internal/inference/select"))
+        # The verifier rerun must use the original candidate tar untouched.
+        self.assertEqual(runner.calls[2][2], prepared.artifacts["candidate.tar"])
+        self.assertEqual(runner.calls[3][2], runner.calls[2][2])
+
+    def test_internal_token_header_sent_when_configured(self):
+        runner = FakeRunner(
+            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        internal = FakeInternalClient([
+            selection_response(),
+            repair_response([adapters_edit()]),
+        ])
+        run_id = self.execute(runner, internal=internal, internal_token="secret-token")
+
+        self.assertEqual(self.store.get_run(run_id)["state"], "completed")
+        self.assertEqual(len(internal.calls), 2)
+        for call in internal.calls:
+            self.assertEqual(call["headers"]["X-Internal-Token"], "secret-token")
 
     def test_verifier_failure_names_the_failed_check(self):
         runner = FakeRunner(
@@ -391,7 +867,8 @@ class WorkerTests(unittest.TestCase):
             checks["count"] += 1
             return checks["count"] > 1
 
-        Worker(self.store, runner).run_forever(should_stop_run)
+        Worker(self.store, runner,
+               http_client=FakeInternalClient([selection_response()])).run_forever(should_stop_run)
         self.assertEqual(self.store.count_state("completed"), 1)
         self.assertEqual(runner.calls[0][0], "preparation")
         self.assertEqual(runner.calls[0][1], 300.0)
@@ -416,7 +893,8 @@ class WorkerTests(unittest.TestCase):
             [attempt_result("baseline", installed="2.31.0"),
              attempt_result("candidate", status="cancelled")],
             hooks={"candidate": lambda: self.store.request_cancel(run_id)})
-        Worker(self.store, runner).execute_run(run)
+        Worker(self.store, runner,
+               http_client=FakeInternalClient([selection_response()])).execute_run(run)
 
         record = self.store.get_run(run_id)
         self.assertEqual(record["state"], "cancelled")

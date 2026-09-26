@@ -1,9 +1,11 @@
 """Serial upgrade-chamber worker that executes leased runs phase by phase.
 
-The worker owns no inference path. Each pass it requeues stale leases, leases
-one queued run, and drives it through the fixed phase machine while persisting
-every state change before the event that describes it. Evidence artifacts are
-written before the terminal update so the manifest can hash the complete
+Each pass the worker requeues stale leases, leases one queued run, and drives
+it through the fixed phase machine while persisting every state change before
+the event that describes it. Model involvement is bounded: a single internal
+inference endpoint confirms the profile-fixed selection, and at most two
+validated repairs may follow a failing candidate attempt. Evidence artifacts
+are written before the terminal update so the manifest can hash the complete
 bundle except for itself, which is accepted as unhashable.
 """
 
@@ -16,10 +18,20 @@ import re
 import signal
 import tarfile
 import time
+import xml.etree.ElementTree as ElementTree
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from upgrade_chamber import edits
 from upgrade_chamber.config import Settings
+from upgrade_chamber.edits import (
+    ALLOWED_EDIT_PATHS,
+    EditValidationError,
+    changed_file_diffs,
+    load_source_zip,
+    member_name,
+)
 from upgrade_chamber.osv import query_osv
 from upgrade_chamber.runner import DockerRunner
 from upgrade_chamber.storage import Store
@@ -52,15 +64,134 @@ VERIFIER_REQUIRED_ARTIFACTS = (
     "installed.json",
 )
 FAILED_OUTCOME_STATUSES = frozenset({"install_failed", "collection_failed", "test_failed"})
-SELECTION_RATIONALE = (
-    "Fixed target version from the validated execution profile; model selection "
-    "is not part of this phase"
-)
 MANIFEST_LIMITATIONS = (
     "Results prove compatibility with the executed suite under the recorded pinned "
     "environment only; they do not establish complete application correctness or "
     "absence of vulnerabilities."
 )
+MAX_REPAIRS = 2
+MAX_INFERENCE_CALLS = 6
+INTERNAL_RESPONSE_LIMIT = 1024 * 1024
+INFERENCE_ERROR_MESSAGE_LIMIT = 500
+INFERENCE_TIMEOUT_SECONDS = 60.0
+LOG_TAIL_LIMIT = 8000
+JUNIT_SUMMARY_LIMIT = 4000
+FAILURE_CONTEXT_LIMIT = 12000
+FILE_CONTEXT_LIMIT = 12000
+RECORD_LIMIT = 2000
+LOG_TAIL_MARKER = "[log tail, truncated to the last 8000 characters]\n"
+JUNIT_SUMMARY_MARKER = "[junit failure summaries, truncated to the first 4000 characters]\n"
+FAILURE_CONTEXT_MARKER = "[failure context truncated to the last 12000 characters]\n"
+FILE_CONTEXT_MARKER = "[file context truncated to the last 12000 characters]\n"
+
+
+class InternalInferenceError(RuntimeError):
+    """One bounded failure of an internal inference endpoint call.
+
+    Carries the provider-shaped code and message extracted from the error
+    body, never the raw response object.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+def _error_body(data: Any, status: Any) -> tuple[str, str]:
+    """Extract a bounded (code, message) pair from an error body or status."""
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        error = data["error"]
+        code = error.get("code")
+        message = error.get("message")
+        if isinstance(code, str) and code:
+            if not isinstance(message, str):
+                message = "inference error"
+            return code, message[:INFERENCE_ERROR_MESSAGE_LIMIT]
+    label = f"http_{status}" if isinstance(status, int) else "invalid_response"
+    return label, "internal inference request failed"
+
+
+def _bounded_tail(text: str, limit: int, marker: str) -> str:
+    """Return the last `limit` characters, prepending the marker when cut."""
+    if len(text) <= limit:
+        return text
+    keep = limit - len(marker)
+    return marker + text[-keep:] if keep > 0 else marker
+
+
+def _bounded_head(text: str, limit: int, marker: str) -> str:
+    """Return the first `limit` characters, prepending the marker when cut."""
+    if len(text) <= limit:
+        return text
+    return marker + text[: limit - len(marker)]
+
+
+def _junit_failure_names(content: bytes) -> list[str]:
+    """Collect the node names of failing or errored testcases in one junit file."""
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError:
+        return []
+    names = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "testcase":
+            continue
+        if not any(child.tag.rsplit("}", 1)[-1] in {"failure", "error"} for child in element):
+            continue
+        classname = element.get("classname") or ""
+        name = element.get("name") or ""
+        names.append(f"{classname}::{name}" if classname else name)
+    return names
+
+
+def _junit_failure_summary(content: bytes | None) -> str:
+    """Bounded text listing the first failing test names, or empty text."""
+    if content is None:
+        return ""
+    names = _junit_failure_names(content)
+    if not names:
+        return ""
+    text = "\n".join(f"failing test: {name}" for name in names)
+    return _bounded_head(text, JUNIT_SUMMARY_LIMIT, JUNIT_SUMMARY_MARKER)
+
+
+def _failure_context(artifacts: dict[str, bytes]) -> str:
+    """Build the bounded failure context from one failed attempt's artifacts.
+
+    Uses the test.log tail and, when present, the junit.xml failure summaries.
+    Every truncation is explicit with a marker line.
+    """
+    log = artifacts.get("test.log")
+    if log is None:
+        log_section = "(test.log is missing from the failed attempt artifacts)\n"
+    else:
+        log_section = _bounded_tail(
+            log.decode("utf-8", errors="replace"), LOG_TAIL_LIMIT, LOG_TAIL_MARKER)
+    junit_section = _junit_failure_summary(artifacts.get("junit.xml"))
+    context = log_section + (f"\n{junit_section}" if junit_section else "")
+    return _bounded_tail(context, FAILURE_CONTEXT_LIMIT, FAILURE_CONTEXT_MARKER)
+
+
+def _file_contexts(source_zip: bytes) -> list[dict[str, str]]:
+    """Build bounded file contexts from the allowed paths present in the zip."""
+    contexts = []
+    with zipfile.ZipFile(io.BytesIO(source_zip)) as archive:
+        present = set(archive.namelist())
+        for path in ALLOWED_EDIT_PATHS:
+            name = member_name(path)
+            if name not in present:
+                continue
+            content = archive.read(name).decode("utf-8", errors="replace")
+            contexts.append({
+                "path": path,
+                "content": _bounded_tail(content, FILE_CONTEXT_LIMIT, FILE_CONTEXT_MARKER),
+            })
+    if not contexts:
+        raise EditValidationError("No allowed edit paths are present in the source zip")
+    return contexts
+
+
 def _utc_now() -> str:
     """Current wall-clock time as an ISO-8601 UTC string."""
     return datetime.now(timezone.utc).isoformat()
@@ -164,6 +295,10 @@ class Worker:
         attempt_timeout: float = 300.0, osv_query: Callable[[str, str], dict] = query_osv,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        inference_base_url: str = "http://127.0.0.1:8000",
+        internal_token: str | None = None,
+        http_client: Any | None = None,
+        max_inference_calls: int = MAX_INFERENCE_CALLS,
     ) -> None:
         self._store = store
         self._runner = runner
@@ -176,6 +311,54 @@ class Worker:
         self._osv_query = osv_query
         self._sleep = sleep
         self._monotonic = monotonic
+        self._inference_base_url = inference_base_url
+        self._internal_token = internal_token
+        self._http_client = http_client
+        self._max_inference_calls = max_inference_calls
+        self._inference_calls = 0
+
+    def _internal_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST one JSON payload to an internal inference endpoint.
+
+        Uses the injected HTTP client or builds a default httpx client with a
+        60 second timeout, no environment proxies, and no redirects. Sends
+        X-Internal-Token when configured. Non-2xx responses, oversized
+        bodies, and malformed payloads become InternalInferenceError carrying
+        the error body's code and message, never a raw response.
+        """
+        if self._http_client is None:
+            import httpx
+
+            self._http_client = httpx.Client(
+                timeout=INFERENCE_TIMEOUT_SECONDS, trust_env=False, follow_redirects=False,
+            )
+        headers = {"Accept": "application/json"}
+        if self._internal_token is not None:
+            headers["X-Internal-Token"] = self._internal_token
+        url = f"{self._inference_base_url}{path}"
+        try:
+            response = self._http_client.post(url, json=payload, headers=headers)
+        except Exception as exc:
+            raise InternalInferenceError(
+                "inference_unavailable",
+                f"transport failed: {type(exc).__name__}: {str(exc)[:INFERENCE_ERROR_MESSAGE_LIMIT]}",
+            ) from None
+        content = response.content
+        if len(content) > INTERNAL_RESPONSE_LIMIT:
+            raise InternalInferenceError(
+                "response_too_large", "Internal inference response exceeds 1 MiB")
+        try:
+            data = json.loads(content)
+        except ValueError:
+            data = None
+        status = getattr(response, "status_code", None)
+        if not isinstance(status, int) or not 200 <= status < 300:
+            code, message = _error_body(data, status)
+            raise InternalInferenceError(code, message)
+        if not isinstance(data, dict):
+            raise InternalInferenceError(
+                "invalid_response", "Internal inference response is not a JSON object")
+        return data
 
     def run_forever(self, should_stop: Callable[[], bool]) -> None:
         """Lease and execute runs until should_stop() turns true."""
@@ -216,6 +399,13 @@ class Worker:
         verifier_summary: dict[str, Any] | None = None
         advisory_snapshots: dict[str, dict[str, Any]] = {}
         source_digest = run["source_sha256"]
+        self._inference_calls = 0
+        model_state: dict[str, Any] | None = None
+        selection_rationale: str | None = None
+        manifest_repairs: list[dict[str, Any]] = []
+        repair_records: list[dict[str, Any]] = []
+        repair_chain: list[tuple[int, bytes, bytes]] = []
+        current_tar: bytes | None = None
 
         def invoke(call: Callable[[], Any]) -> tuple[Any, str, str]:
             """Run one runner call, bracket it with timestamps, and track cleanup."""
@@ -231,14 +421,15 @@ class Worker:
             """Persist evidence, the run record, the state, and the terminal event."""
             cleanup_state = "observed" if cleanup_observed else "unobserved"
             if reached_upgrade:
-                self._save_patch(run, baseline_tar, candidate_tar)
+                self._save_patch(run, baseline_tar, candidate_tar, repair_chain)
                 self._save_comparison(
                     run, terminal_state, detail, baseline_summary,
-                    candidate_summary, verifier_summary,
+                    candidate_summary, verifier_summary, repair_records,
                 )
                 self._save_manifest(
                     run, terminal_state, detail, cleanup_state,
                     advisory_snapshots, baseline_summary, source_digest,
+                    model_state, selection_rationale, manifest_repairs,
                 )
             result_payload = {
                 "state": terminal_state,
@@ -246,6 +437,11 @@ class Worker:
                 "baseline": baseline_summary,
                 "candidate": candidate_summary,
             }
+            if model_state is not None:
+                result_payload["model"] = {
+                    "model_id": model_state["model_id"],
+                    "repair_count": model_state["repair_count"],
+                }
             self._store.update_run(
                 run_id,
                 terminal_utc=_utc_now(),
@@ -334,13 +530,50 @@ class Worker:
             finalize(*stop)
             return
 
-        # Phase 3: record the fixed selection and cache advisory snapshots.
+        # Phase 3: the model confirms the profile-fixed target version through
+        # the internal inference endpoint, then advisories are cached.
         self._transition(run_id, "selecting")
+        self._inference_calls += 1
+        selection_context = (
+            f"{run['repo_url']} at commit {run['commit_sha']}, profile {run['profile_id']}, "
+            f"upgrading {run['dependency']} {run['baseline_version']} -> "
+            f"{run['target_version']}; the baseline suite passes on the baseline version."
+        )
+        try:
+            selection_result = self._internal_post("/internal/inference/select", {
+                "run_id": run_id,
+                "package": run["dependency"],
+                "eligible_versions": [run["target_version"]],
+                "context": selection_context,
+            })
+        except InternalInferenceError as exc:
+            finalize("infrastructure_failed", f"model selection failed: {exc.code}: {exc.message}")
+            return
+        selection = selection_result.get("selection")
+        selected_version = (
+            selection.get("target_version") if isinstance(selection, dict) else None
+        )
+        if not isinstance(selected_version, str) or selected_version != run["target_version"]:
+            finalize(
+                "infrastructure_failed",
+                f"model selection failed: returned ineligible target version {selected_version!r}",
+            )
+            return
+        selection_rationale = selection.get("rationale")
+        if not isinstance(selection_rationale, str):
+            selection_rationale = ""
+        model_state = {
+            "model_id": selection_result.get("model_id"),
+            "repair_count": 0,
+        }
         self._store.append_event(run_id, "selection", {
             "package": run["dependency"],
-            "target_version": run["target_version"],
-            "source": "profile",
-            "rationale": SELECTION_RATIONALE,
+            "target_version": selected_version,
+            "source": "model",
+            "rationale": selection_rationale,
+            "model_id": selection_result.get("model_id"),
+            "attempts": selection_result.get("attempts"),
+            "usage": selection_result.get("usage"),
         })
         for position, version in (
             ("baseline", run["baseline_version"]),
@@ -368,8 +601,11 @@ class Worker:
             return
 
         # Phase 4: install the candidate and run the suite under the same bounds.
+        # A failing candidate whose collected IDs still match the baseline enters
+        # the bounded repairing loop; everything else stays terminal as before.
         self._transition(run_id, "upgrading")
         reached_upgrade = True
+        current_tar = candidate_tar
         candidate, started_utc, finished_utc = invoke(
             lambda: self._runner.run_profile_attempt(
                 candidate_tar, phase="candidate",
@@ -380,16 +616,173 @@ class Worker:
         self._record_attempt(run_id, "candidate", candidate, started_utc, finished_utc)
         self._save_prefixed_artifacts(run_id, "candidate", candidate.artifacts)
         candidate_summary = _marker_summary(candidate.marker)
-        protected = candidate.status == "passed" or candidate.status in FAILED_OUTCOME_STATUSES
         baseline_ids = baseline_summary["collected_test_ids"] if baseline_summary else []
+        protected = candidate.status == "passed" or candidate.status in FAILED_OUTCOME_STATUSES
         if (
             protected and candidate.marker is not None
             and candidate.marker["collected_test_ids"] != baseline_ids
         ):
             finalize("upgrade_failed", "collected test IDs changed from baseline")
             return
+        repaired = False
+        provider_note: tuple[str, str] | None = None
         if candidate.status == "passed":
             pass
+        elif candidate.status == "test_failed":
+            try:
+                current_zip = load_source_zip(current_tar)
+            except EditValidationError as exc:
+                finalize(
+                    "upgrade_failed",
+                    f"test_failed: {_result_error(candidate)}; repair context unavailable: {exc}",
+                )
+                return
+            latest_failure: Any = candidate
+            for repair_number in range(1, MAX_REPAIRS + 1):
+                stop = pre_phase_stop()
+                if stop is not None:
+                    finalize(*stop)
+                    return
+                if self._inference_calls >= self._max_inference_calls:
+                    break
+                self._transition(run_id, "repairing", attempt=repair_number)
+                try:
+                    failure_context = _failure_context(latest_failure.artifacts)
+                    file_contexts = _file_contexts(current_zip)
+                except EditValidationError as exc:
+                    finalize(
+                        "upgrade_failed",
+                        f"test_failed: {_result_error(latest_failure)};"
+                        f" repair context unavailable: {exc}",
+                    )
+                    return
+                self._inference_calls += 1
+                try:
+                    repair_result = self._internal_post("/internal/inference/repair", {
+                        "run_id": run_id,
+                        "package": run["dependency"],
+                        "target_version": run["target_version"],
+                        "failure_context": failure_context,
+                        "file_contexts": file_contexts,
+                        "allowed_paths": list(ALLOWED_EDIT_PATHS),
+                    })
+                except InternalInferenceError as exc:
+                    provider_note = (exc.code, exc.message)
+                    self._store.append_event(run_id, "repair", {
+                        "attempt": repair_number,
+                        "status": "provider_error",
+                        "error_code": exc.code,
+                        "message": exc.message,
+                    })
+                    break
+                repair = repair_result.get("repair")
+                summary = repair.get("summary") if isinstance(repair, dict) else None
+                if not isinstance(summary, str):
+                    summary = ""
+                summary = summary[:RECORD_LIMIT]
+                proposed = repair.get("edits") if isinstance(repair, dict) else None
+                edit_paths = [
+                    item["path"] for item in proposed
+                    if isinstance(item, dict) and isinstance(item.get("path"), str)
+                ] if isinstance(proposed, list) else []
+                model_state["model_id"] = repair_result.get("model_id")
+                model_state["repair_count"] = repair_number
+                record = {
+                    "attempt": repair_number,
+                    "summary": summary,
+                    "status": "proposed",
+                    "edit_paths": edit_paths,
+                }
+                repair_records.append(record)
+                manifest_repairs.append({"attempt": repair_number, "summary": summary})
+                self._store.append_event(run_id, "repair", {
+                    "attempt": repair_number,
+                    "status": "proposed",
+                    "summary": summary,
+                    "edit_paths": edit_paths,
+                    "model_id": repair_result.get("model_id"),
+                    "attempts": repair_result.get("attempts"),
+                    "usage": repair_result.get("usage"),
+                })
+                try:
+                    validated = edits.validate_edits(current_zip, proposed)
+                except EditValidationError as exc:
+                    record["status"] = "rejected"
+                    self._store.append_event(run_id, "repair", {
+                        "attempt": repair_number,
+                        "status": "rejected",
+                        "reason": str(exc)[:RECORD_LIMIT],
+                    })
+                    continue
+                try:
+                    new_zip, new_sha = edits.apply_edits(current_zip, validated)
+                    new_tar = edits.rebuild_candidate_tar(current_tar, new_zip, new_sha)
+                except (EditValidationError, RuntimeError, tarfile.TarError) as exc:
+                    finalize(
+                        "upgrade_failed",
+                        f"test_failed: {_result_error(latest_failure)};"
+                        f" repair application failed: {exc}",
+                    )
+                    return
+                repair_chain.append((repair_number, current_zip, new_zip))
+                current_zip = new_zip
+                current_tar = new_tar
+                self._transition(run_id, "upgrading")
+                attempt_result, attempt_started, attempt_finished = invoke(
+                    lambda: self._runner.run_profile_attempt(
+                        current_tar, phase="candidate",
+                        timeout_seconds=min(self._attempt_timeout, remaining()),
+                        should_cancel=should_cancel,
+                    )
+                )
+                self._record_attempt(
+                    run_id, f"repair-{repair_number}", attempt_result,
+                    attempt_started, attempt_finished,
+                )
+                self._save_prefixed_artifacts(
+                    run_id, f"repair{repair_number}", attempt_result.artifacts)
+                candidate_summary = _marker_summary(attempt_result.marker)
+                protected = (
+                    attempt_result.status == "passed"
+                    or attempt_result.status in FAILED_OUTCOME_STATUSES
+                )
+                if (
+                    protected and attempt_result.marker is not None
+                    and attempt_result.marker["collected_test_ids"] != baseline_ids
+                ):
+                    finalize("upgrade_failed", "collected test IDs changed from baseline")
+                    return
+                if attempt_result.status == "passed":
+                    repaired = True
+                    break
+                if attempt_result.status == "test_failed":
+                    latest_failure = attempt_result
+                    continue
+                if attempt_result.status == "timed_out":
+                    finalize("timed_out", f"repair-{repair_number} attempt timed out")
+                    return
+                if attempt_result.status == "cancelled":
+                    finalize("cancelled", "cancelled by request")
+                    return
+                if attempt_result.status in FAILED_OUTCOME_STATUSES:
+                    finalize(
+                        "upgrade_failed",
+                        f"{attempt_result.status}: {_result_error(attempt_result)}",
+                    )
+                    return
+                finalize(
+                    "infrastructure_failed",
+                    f"repair-{repair_number} attempt {attempt_result.status}:"
+                    f" {_result_error(attempt_result)}",
+                )
+                return
+            if not repaired:
+                detail = f"test_failed: {_result_error(latest_failure)}"
+                if provider_note is not None:
+                    note_code, note_message = provider_note
+                    detail += f"; repair loop ended on provider error: {note_code}: {note_message}"
+                finalize("upgrade_failed", detail)
+                return
         elif candidate.status in FAILED_OUTCOME_STATUSES:
             finalize("upgrade_failed", f"{candidate.status}: {_result_error(candidate)}")
             return
@@ -412,10 +805,12 @@ class Worker:
             return
 
         # Phase 5: a fresh verifier rerun must confirm every protected property.
+        # It always runs on the final accepted tar: the repaired tar when a
+        # repair passed, otherwise the original candidate tar.
         self._transition(run_id, "verifying")
         verifier, started_utc, finished_utc = invoke(
             lambda: self._runner.run_profile_attempt(
-                candidate_tar, phase="candidate",
+                current_tar, phase="candidate",
                 timeout_seconds=min(self._attempt_timeout, remaining()),
                 should_cancel=should_cancel,
             )
@@ -429,10 +824,10 @@ class Worker:
             return
         finalize("completed", None)
 
-    def _transition(self, run_id: int, state: str) -> None:
+    def _transition(self, run_id: int, state: str, **extra: Any) -> None:
         """Persist one non-terminal state change before its state event."""
         self._store.set_run_state(run_id, state)
-        self._store.append_event(run_id, "state", {"state": state})
+        self._store.append_event(run_id, "state", {"state": state, **extra})
 
     def _record_attempt(
         self, run_id: int, phase: str, result: Any, started_utc: str, finished_utc: str
@@ -474,8 +869,11 @@ class Worker:
             if name in artifacts:
                 self._save_artifact(run_id, f"{prefix}-{name}", artifacts[name], kind="report")
 
-    def _save_patch(self, run: dict, baseline_tar: bytes | None, candidate_tar: bytes | None) -> None:
-        """Build the deterministic requirements diff, never fabricating content."""
+    def _save_patch(
+        self, run: dict, baseline_tar: bytes | None, candidate_tar: bytes | None,
+        repair_chain: list[tuple[int, bytes, bytes]],
+    ) -> None:
+        """Build the deterministic pin diff plus accumulated repair source diffs."""
         baseline_text = _requirements_text(baseline_tar)
         candidate_text = _requirements_text(candidate_tar)
         if baseline_text is None and candidate_text is None:
@@ -492,15 +890,26 @@ class Worker:
                 tofile=f"requirements.txt@{run['target_version']}",
             )
             content = "".join(diff)
+            for repair_number, zip_before, zip_after in repair_chain:
+                content += (
+                    f"\n--- repair {repair_number} source changes ---\n"
+                    + changed_file_diffs(zip_before, zip_after)
+                )
             self._save_artifact(run["id"], "patch.diff", content.encode("utf-8"), kind="patch")
             return
         content = f"# patch input unavailable: {reason}\n"
+        for repair_number, zip_before, zip_after in repair_chain:
+            content += (
+                f"\n--- repair {repair_number} source changes ---\n"
+                + changed_file_diffs(zip_before, zip_after)
+            )
         self._save_artifact(run["id"], "patch.diff", content.encode("utf-8"), kind="patch")
 
     def _save_comparison(
         self, run: dict, terminal_state: str, detail: str | None,
         baseline_summary: dict[str, Any] | None, candidate_summary: dict[str, Any] | None,
         verifier_summary: dict[str, Any] | None,
+        repair_records: list[dict[str, Any]],
     ) -> None:
         """Persist the machine-readable before/after comparison artifact."""
         baseline_ids = baseline_summary["collected_test_ids"] if baseline_summary else None
@@ -512,6 +921,7 @@ class Worker:
                 baseline_ids is not None and candidate_ids is not None
                 and baseline_ids == candidate_ids
             ),
+            "repairs": repair_records,
             "verifier": verifier_summary,
             "result": terminal_state,
             "detail": detail,
@@ -522,7 +932,8 @@ class Worker:
     def _save_manifest(
         self, run: dict, terminal_state: str, detail: str | None, cleanup_state: str,
         advisory_snapshots: dict[str, dict[str, Any]], baseline_summary: dict[str, Any] | None,
-        source_digest: str,
+        source_digest: str, model_state: dict[str, Any] | None,
+        selection_rationale: str | None, manifest_repairs: list[dict[str, Any]],
     ) -> None:
         """Persist the manifest last, hashing every artifact except itself."""
         run_id = run["id"]
@@ -562,6 +973,11 @@ class Worker:
                 "last": baseline_ids[-1] if baseline_ids else None,
             },
             "attempts": attempts,
+            "model": {
+                "model_id": model_state["model_id"] if model_state else None,
+                "selection": {"rationale": selection_rationale},
+                "repairs": manifest_repairs,
+            },
             "advisories": {
                 "baseline": _advisory_summary(advisory_snapshots.get("baseline")),
                 "target": _advisory_summary(advisory_snapshots.get("target")),
@@ -601,6 +1017,7 @@ def main() -> int:
             job_deadline_seconds=settings.job_deadline_seconds,
             lease_seconds=settings.lease_seconds,
             poll_seconds=settings.poll_seconds,
+            internal_token=settings.internal_token,
         )
         signal.signal(signal.SIGTERM, _request_stop)
         signal.signal(signal.SIGINT, _request_stop)
