@@ -13,9 +13,11 @@ from upgrade_chamber.config import Settings
 
 
 VULTR_API_ROOT = "https://api.vultrinference.com/v1"
-MAX_PROMPT_BYTES = 32 * 1024
+# Agentic conversations carry bounded tool results, so the prompt envelope is doubled.
+MAX_PROMPT_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
-MAX_MESSAGES = 16
+# Agent conversations interleave many system, user, and assistant turns, so the cap is raised.
+MAX_MESSAGES = 24
 
 
 class InferenceError(RuntimeError):

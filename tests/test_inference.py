@@ -84,7 +84,7 @@ def test_prompt_schema_and_byte_limits_fail_before_request():
         with pytest.raises(ValueError, match="byte limit"):
             inference.chat_completion([{"role": "user", "content": "é" * MAX_PROMPT_BYTES}])
         with pytest.raises(ValueError, match="bounded"):
-            inference.chat_completion([{"role": "user", "content": "hello"}] * 17)
+            inference.chat_completion([{"role": "user", "content": "hello"}] * 25)
 
 
 def test_redirect_is_rejected_even_when_injected_client_follows_redirects(capsys):
@@ -227,7 +227,7 @@ def test_structured_bounds_fail_before_any_request():
             )
         with pytest.raises(ValueError, match="bounded"):
             inference.chat_completion_structured(
-                [{"role": "user", "content": "hello"}] * 17,
+                [{"role": "user", "content": "hello"}] * 25,
                 max_tokens=64,
                 correction_prompt="fix it",
             )

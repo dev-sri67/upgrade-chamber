@@ -1,19 +1,17 @@
 """Public API: admission-controlled run submission, status, events, cancellation, artifacts.
 
-Internal endpoints POST /internal/inference/select and /internal/inference/repair wrap the
+Internal endpoints POST /internal/inference/select and /internal/inference/agent-turn wrap the
 structured inference calls for the worker; they carry no run-token auth and persist nothing
 about runs.
 """
 
-import hashlib
 import hmac
 import json
-import re
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
@@ -59,13 +57,28 @@ class RunSubmission(BaseModel):
     idempotency_key: str | None = Field(default=None, max_length=200)
 
 
-class FileContext(BaseModel):
-    """One bounded source file snapshot supplied to a repair request."""
+class AgentTurnMessage(BaseModel):
+    """One conversation turn supplied by the worker; roles and size stay bounded."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    path: str
-    content: str = Field(max_length=12000)
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1, max_length=65536)
+
+
+class AgentTurnRequest(BaseModel):
+    """Strict body for POST /internal/inference/agent-turn.
+
+    The worker owns the full conversation; this endpoint adds no prompts of its own.
+    The per-message caps bound each turn; the transport still enforces its total
+    prompt-byte limit and a request over it maps defensively to 502 inference_unavailable.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: int
+    messages: list[AgentTurnMessage] = Field(min_length=1, max_length=24)
+    max_tokens: int = Field(ge=1, le=8192)
 
 
 class SelectRequest(BaseModel):
@@ -79,19 +92,6 @@ class SelectRequest(BaseModel):
     context: str = Field(max_length=8000)
 
 
-class RepairRequest(BaseModel):
-    """Strict body for POST /internal/inference/repair."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    run_id: int
-    package: str
-    target_version: str
-    failure_context: str = Field(max_length=12000)
-    file_contexts: list[FileContext] = Field(min_length=1, max_length=4)
-    allowed_paths: list[str] = Field(min_length=1, max_length=8)
-
-
 _SELECT_SYSTEM_PROMPT = (
     "You are a dependency upgrade selector for a Python repository. Choose exactly one "
     "eligible target version from the provided list. Respond ONLY with a single JSON object: "
@@ -99,18 +99,13 @@ _SELECT_SYSTEM_PROMPT = (
     "The rationale must be at most 2000 characters."
 )
 
-_REPAIR_SYSTEM_PROMPT = (
-    "You are a compatibility repairer for one Python package upgrade. Propose the smallest "
-    "safe source change that makes the failing tests pass under the target version. Edit only "
-    "files from the provided allowed paths; never edit tests, test configuration, or CI. "
-    "Respond ONLY with a single JSON object: "
-    '{"summary": "...", "edits": [{"path": "...", "original_sha256": "...", "replacement_text": "..."}]}. '
-    "The replacement_text must be the complete new content of that file."
-)
-
 _STRUCTURED_CORRECTION_PROMPT = (
     "Your previous reply was not a single JSON object of the required shape. "
     "Respond ONLY with the JSON object."
+)
+
+_AGENT_TURN_CORRECTION_PROMPT = (
+    "Your previous reply was not a single JSON object. Respond ONLY with the required JSON object."
 )
 
 
@@ -137,35 +132,6 @@ def _selection_violation(content: dict, package: str, eligible_versions: list[st
     rationale = content["rationale"]
     if not isinstance(rationale, str) or not 1 <= len(rationale) <= 2000:
         return "Selection rationale must be a string of 1..2000 characters."
-    return None
-
-
-def _repair_violation(content: dict) -> str | None:
-    """Name the first violated repair JSON schema check, if any.
-
-    Semantic validation (allow-list membership, hash match, line caps) belongs to the
-    worker's edits.validate_edits; only the schema-level constraints are checked here.
-    """
-    summary = content.get("summary")
-    if not isinstance(summary, str) or not 1 <= len(summary) <= 2000:
-        return "Repair summary must be a string of 1..2000 characters."
-    edits = content.get("edits")
-    if not isinstance(edits, list) or not 1 <= len(edits) <= 5:
-        return "Repair edits must be a list of 1..5 edit objects."
-    for index, edit in enumerate(edits, start=1):
-        if not isinstance(edit, dict) or set(edit) != {"path", "original_sha256", "replacement_text"}:
-            return (
-                f"Repair edit {index} must have exactly the keys path, original_sha256, "
-                "and replacement_text."
-            )
-        if not isinstance(edit["path"], str) or not 1 <= len(edit["path"]) <= 200:
-            return f"Repair edit {index} path must be a string of 1..200 characters."
-        digest = edit["original_sha256"]
-        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
-            return f"Repair edit {index} original_sha256 must be a 64-character hexadecimal string."
-        replacement = edit["replacement_text"]
-        if not isinstance(replacement, str) or not 1 <= len(replacement) <= 262144:
-            return f"Repair edit {index} replacement_text must be a string of 1..262144 characters."
     return None
 
 
@@ -460,13 +426,19 @@ def _register_routes(application: FastAPI, runtime: Callable[[], tuple[Settings,
                 "Send the configured shared token in the 'X-Internal-Token' header.",
             )
 
-    def structured_call(settings: Settings, messages: list[dict[str, str]], *, max_tokens: int) -> StructuredResult:
+    def structured_call(
+        settings: Settings,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        correction_prompt: str = _STRUCTURED_CORRECTION_PROMPT,
+    ) -> StructuredResult:
         """Run one structured inference call and close the client when it owns one."""
         factory = getattr(application.state, "inference_factory", None) or _default_inference_factory
         client = factory(settings)
         try:
             return client.chat_completion_structured(
-                messages, max_tokens=max_tokens, correction_prompt=_STRUCTURED_CORRECTION_PROMPT)
+                messages, max_tokens=max_tokens, correction_prompt=correction_prompt)
         finally:
             closer = getattr(client, "close", None)
             if callable(closer):
@@ -510,40 +482,30 @@ def _register_routes(application: FastAPI, runtime: Callable[[], tuple[Settings,
             "usage": result.usage,
         }
 
-    @application.post("/internal/inference/repair")
-    def repair_inference(
-        request: RepairRequest,
+    @application.post("/internal/inference/agent-turn")
+    def agent_turn_inference(
+        request: AgentTurnRequest,
         _token_ok: Annotated[None, Depends(internal_authorization)],
     ) -> dict:
-        """Propose bounded source edits for one failing upgrade via structured inference."""
+        """Advance the worker's conversation with one structured inference call."""
         settings, _store = runtime()
         model_id = _require_model_id(settings)
-        sections = [
-            f"Package: {request.package}",
-            f"Target version: {request.target_version}",
-            f"Failure context:\n{request.failure_context}",
-        ]
-        for item in request.file_contexts:
-            digest = hashlib.sha256(item.content.encode("utf-8")).hexdigest()
-            sections.append(f"File: {item.path}\nCurrent sha256: {digest}\nContent:\n{item.content}")
-        sections.append(f"Allowed paths: {json.dumps(request.allowed_paths)}")
-        messages = [
-            {"role": "system", "content": _REPAIR_SYSTEM_PROMPT},
-            {"role": "user", "content": "\n\n".join(sections)},
-        ]
+        messages = [{"role": item.role, "content": item.content} for item in request.messages]
         try:
-            result = structured_call(settings, messages, max_tokens=4096)
+            result = structured_call(
+                settings,
+                messages,
+                max_tokens=request.max_tokens,
+                correction_prompt=_AGENT_TURN_CORRECTION_PROMPT,
+            )
         except (InferenceError, ValueError) as exc:
             raise ApiError(502, "inference_unavailable", str(exc)[:500]) from None
         content = _structured_content(result)
-        violation = _repair_violation(content)
-        if violation is not None:
-            raise ApiError(422, "invalid_repair", violation)
         return {
-            "repair": {"summary": content["summary"], "edits": content["edits"]},
-            "model_id": model_id,
-            "attempts": result.attempts,
+            "message": content,
             "usage": result.usage,
+            "attempts": result.attempts,
+            "model_id": model_id,
         }
 
 

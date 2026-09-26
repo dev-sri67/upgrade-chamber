@@ -1,6 +1,5 @@
 """API contract checks: admission, run records, events, cancellation, artifacts, and readiness."""
 
-import hashlib
 import json
 import tempfile
 import unittest
@@ -91,14 +90,14 @@ def select_body(**overrides) -> dict:
     return body
 
 
-def repair_body(**overrides) -> dict:
+def agent_turn_body(**overrides) -> dict:
     body = {
         "run_id": 1,
-        "package": "requests",
-        "target_version": "2.32.0",
-        "failure_context": "tests fail under the target version",
-        "file_contexts": [{"path": "src/example.py", "content": "value = 1\n"}],
-        "allowed_paths": ["src/example.py"],
+        "messages": [
+            {"role": "system", "content": "You are the upgrade worker agent."},
+            {"role": "user", "content": "Choose the next tool call and answer with one JSON object."},
+        ],
+        "max_tokens": 2048,
     }
     body.update(overrides)
     return body
@@ -110,15 +109,16 @@ def selection_result(**overrides) -> StructuredResult:
     return StructuredResult(ok=True, content=content, usage={"total_tokens": 7}, attempts=1, error=None)
 
 
-def repair_result(**overrides) -> StructuredResult:
-    content = {
-        "summary": "bumped the constant",
-        "edits": [
-            {"path": "src/example.py", "original_sha256": "a" * 64, "replacement_text": "value = 2\n"}
-        ],
+def agent_turn_result(**overrides) -> StructuredResult:
+    fields = {
+        "ok": True,
+        "content": {"tool": "read_file", "args": {"path": "x.py"}},
+        "usage": {"total_tokens": 11},
+        "attempts": 1,
+        "error": None,
     }
-    content.update(overrides)
-    return StructuredResult(ok=True, content=content, usage=None, attempts=2, error=None)
+    fields.update(overrides)
+    return StructuredResult(**fields)
 
 
 class ApiContractTests(unittest.TestCase):
@@ -512,52 +512,96 @@ class InternalInferenceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["message"], "model id not configured")
 
-    def test_repair_happy_path(self):
+    def test_agent_turn_happy_path_passthrough(self):
         stub = StubInference()
         client, settings = self.make_client(stub)
-        stub.result = repair_result()
-        response = client.post("/internal/inference/repair", json=repair_body())
+        stub.result = agent_turn_result()
+        body = agent_turn_body()
+        response = client.post("/internal/inference/agent-turn", json=body)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
-            "repair": {
-                "summary": "bumped the constant",
-                "edits": [{
-                    "path": "src/example.py",
-                    "original_sha256": "a" * 64,
-                    "replacement_text": "value = 2\n",
-                }],
-            },
+            "message": {"tool": "read_file", "args": {"path": "x.py"}},
+            "usage": {"total_tokens": 11},
+            "attempts": 1,
             "model_id": settings.vultr_model_id,
-            "attempts": 2,
-            "usage": None,
         })
-        self.assertEqual(stub.calls[0]["max_tokens"], 4096)
-        user_content = stub.calls[0]["messages"][1]["content"]
-        self.assertIn("src/example.py", user_content)
-        self.assertIn(hashlib.sha256(b"value = 1\n").hexdigest(), user_content)
-        self.assertIn('["src/example.py"]', user_content)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.calls[0]["max_tokens"], 2048)
+        self.assertEqual(stub.calls[0]["messages"], body["messages"])
+        self.assertEqual(
+            stub.calls[0]["correction_prompt"],
+            "Your previous reply was not a single JSON object. "
+            "Respond ONLY with the required JSON object.",
+        )
 
-    def test_repair_six_edits_rejected(self):
+    def test_agent_turn_failed_structured_result_maps_to_502(self):
         stub = StubInference()
         client, _ = self.make_client(stub)
-        six_edits = [
-            {"path": f"src/file{i}.py", "original_sha256": "a" * 64, "replacement_text": "x = 1\n"}
-            for i in range(6)
-        ]
-        stub.result = repair_result(edits=six_edits)
-        response = client.post("/internal/inference/repair", json=repair_body())
-        self.assertEqual(response.status_code, 422)
-        self.assertEqual(response.json()["error"]["code"], "invalid_repair")
+        stub.result = StructuredResult(
+            ok=False,
+            content=None,
+            usage=None,
+            attempts=2,
+            error="structured response invalid after one correction retry",
+        )
+        response = client.post("/internal/inference/agent-turn", json=agent_turn_body())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "inference_unavailable")
+        self.assertIn("structured response invalid", response.json()["error"]["message"])
 
-    def test_repair_failure_context_over_cap_rejected(self):
+    def test_agent_turn_transport_error_maps_to_502(self):
         stub = StubInference()
         client, _ = self.make_client(stub)
-        stub.result = repair_result()
-        response = client.post(
-            "/internal/inference/repair", json=repair_body(failure_context="x" * 12001))
+        stub.result = InferenceError("Vultr inference transport failed")
+        response = client.post("/internal/inference/agent-turn", json=agent_turn_body())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "inference_unavailable")
+
+    def test_agent_turn_non_dict_content_maps_to_502(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = StructuredResult(
+            ok=True, content=["not", "a", "dict"], usage=None, attempts=2, error=None)
+        response = client.post("/internal/inference/agent-turn", json=agent_turn_body())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "inference_unavailable")
+        self.assertIn("structured response invalid", response.json()["error"]["message"])
+
+    def test_agent_turn_message_count_over_cap_rejected(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = agent_turn_result()
+        body = agent_turn_body(messages=[
+            {"role": "user", "content": "turn"} for _ in range(25)
+        ])
+        response = client.post("/internal/inference/agent-turn", json=body)
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "invalid_request")
-        self.assertIn("failure_context", response.json()["error"]["message"])
+        self.assertIn("messages", response.json()["error"]["message"])
+
+    def test_agent_turn_content_over_cap_rejected(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        stub.result = agent_turn_result()
+        body = agent_turn_body(messages=[{"role": "user", "content": "x" * 65537}])
+        response = client.post("/internal/inference/agent-turn", json=body)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertIn("content", response.json()["error"]["message"])
+
+    def test_agent_turn_body_shape_and_caps_rejected(self):
+        stub = StubInference()
+        client, _ = self.make_client(stub)
+        for body in (
+            agent_turn_body(messages=[]),
+            agent_turn_body(max_tokens=0),
+            agent_turn_body(max_tokens=8193),
+            agent_turn_body(messages=[{"role": "tool", "content": "not allowed"}]),
+            {**agent_turn_body(), "unexpected": True},
+        ):
+            response = client.post("/internal/inference/agent-turn", json=body)
+            self.assertEqual(response.status_code, 422, body)
+            self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
     def test_internal_token_required_when_configured(self):
         stub = StubInference()
@@ -577,16 +621,16 @@ class InternalInferenceTests(unittest.TestCase):
         )
         self.assertEqual(good.status_code, 200)
 
-        stub.result = repair_result()
-        repair_missing = client.post("/internal/inference/repair", json=repair_body())
-        self.assertEqual(repair_missing.status_code, 401)
-        self.assertEqual(repair_missing.json()["error"]["code"], "unauthorized")
-        repair_good = client.post(
-            "/internal/inference/repair",
-            json=repair_body(),
+        stub.result = agent_turn_result()
+        turn_missing = client.post("/internal/inference/agent-turn", json=agent_turn_body())
+        self.assertEqual(turn_missing.status_code, 401)
+        self.assertEqual(turn_missing.json()["error"]["code"], "unauthorized")
+        turn_good = client.post(
+            "/internal/inference/agent-turn",
+            json=agent_turn_body(),
             headers={"X-Internal-Token": "secret-token"},
         )
-        self.assertEqual(repair_good.status_code, 200)
+        self.assertEqual(turn_good.status_code, 200)
 
     def test_internal_endpoints_open_without_token(self):
         stub = StubInference()
@@ -594,9 +638,9 @@ class InternalInferenceTests(unittest.TestCase):
         stub.result = selection_result()
         self.assertEqual(
             client.post("/internal/inference/select", json=select_body()).status_code, 200)
-        stub.result = repair_result()
+        stub.result = agent_turn_result()
         self.assertEqual(
-            client.post("/internal/inference/repair", json=repair_body()).status_code, 200)
+            client.post("/internal/inference/agent-turn", json=agent_turn_body()).status_code, 200)
 
 
 if __name__ == "__main__":
