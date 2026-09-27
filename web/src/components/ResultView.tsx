@@ -61,11 +61,16 @@ interface LoadedState {
   detailError: ApiRequestError | null;
   comparison: ComparisonArtifact | null;
   comparisonMissing: boolean;
+  /** Honest inline error for comparison.json when it exists but cannot be shown. */
+  comparisonError: string | null;
   manifest: ManifestArtifact | null;
   manifestMissing: boolean;
+  manifestError: string | null;
   patchText: string | null;
   patchMissing: boolean;
-  advisories: Record<string, AdvisorySnapshot | 'missing'>;
+  patchError: string | null;
+  /** Advisory result per name: parsed snapshot, 'missing' (404), or an error message. */
+  advisories: Record<string, AdvisorySnapshot | 'missing' | string>;
 }
 
 const EMPTY_STATE: LoadedState = {
@@ -73,10 +78,13 @@ const EMPTY_STATE: LoadedState = {
   detailError: null,
   comparison: null,
   comparisonMissing: false,
+  comparisonError: null,
   manifest: null,
   manifestMissing: false,
+  manifestError: null,
   patchText: null,
   patchMissing: false,
+  patchError: null,
   advisories: {},
 };
 
@@ -84,35 +92,55 @@ function isApiError(value: unknown): value is ApiRequestError {
   return value instanceof ApiRequestError;
 }
 
+/** Collapse any thrown error into an honest one-line message for the UI. */
+function describeError(error: unknown): string {
+  if (isApiError(error)) {
+    return `${error.code}: ${error.message}`;
+  }
+  return 'Network request failed.';
+}
+
+/**
+ * Fetch a text artifact without ever throwing. A 404 becomes `missing`, any
+ * other failure becomes an inline error message so one bad artifact can
+ * never leave the result view stuck on its loading state.
+ */
 async function optionalText(
   runId: number,
   name: string,
   token: string,
-): Promise<{ text: string | null; missing: boolean }> {
+): Promise<{ text: string | null; missing: boolean; error: string | null }> {
   try {
-    return { text: await getArtifactText(runId, name, token), missing: false };
+    return { text: await getArtifactText(runId, name, token), missing: false, error: null };
   } catch (error) {
     if (isApiError(error) && error.status === 404) {
-      return { text: null, missing: true };
+      return { text: null, missing: true, error: null };
     }
-    throw error;
+    return { text: null, missing: false, error: describeError(error) };
   }
 }
 
+/**
+ * Fetch a JSON artifact without ever throwing. The bounded parse try/catch
+ * renders an honest inline error instead of pretending the file is missing.
+ */
 async function optionalJson<T>(
   runId: number,
   name: string,
   token: string,
-): Promise<{ value: T | null; missing: boolean }> {
-  const { text, missing } = await optionalText(runId, name, token);
+): Promise<{ value: T | null; missing: boolean; error: string | null }> {
+  const { text, missing, error } = await optionalText(runId, name, token);
+  if (error !== null) {
+    return { value: null, missing: false, error };
+  }
   if (text === null) {
-    return { value: null, missing };
+    return { value: null, missing, error: null };
   }
   try {
-    return { value: JSON.parse(text) as T, missing: false };
+    return { value: JSON.parse(text) as T, missing: false, error: null };
   } catch {
-    // The artifact exists but is not valid JSON; show it honestly as unavailable.
-    return { value: null, missing: true };
+    // The artifact exists but is not valid JSON; say so instead of hanging.
+    return { value: null, missing: false, error: 'Artifact is not valid JSON.' };
   }
 }
 
@@ -124,44 +152,76 @@ export function ResultView({ runId, token, onBack }: ResultViewProps) {
   useEffect(() => {
     let active = true;
     (async () => {
-      const [detailResult, comparison, manifest, patch] = await Promise.allSettled([
-        getRun(runId, token),
-        optionalJson<ComparisonArtifact>(runId, COMPARISON_NAME, token),
-        optionalJson<ManifestArtifact>(runId, MANIFEST_NAME, token),
-        optionalText(runId, PATCH_NAME, token),
-      ]);
-      const advisories: Record<string, AdvisorySnapshot | 'missing'> = {};
-      await Promise.all(
-        ADVISORY_NAMES.map(async (name) => {
-          const result = await optionalJson<AdvisorySnapshot>(runId, name, token);
-          advisories[name] = result.value ?? 'missing';
-        }),
-      );
-      if (!active) {
-        return;
+      try {
+        const [detailResult, comparison, manifest, patch, advisoryResults] =
+          await Promise.allSettled([
+            getRun(runId, token),
+            optionalJson<ComparisonArtifact>(runId, COMPARISON_NAME, token),
+            optionalJson<ManifestArtifact>(runId, MANIFEST_NAME, token),
+            optionalText(runId, PATCH_NAME, token),
+            // All advisory artifacts resolve independently; one failure must
+            // not block the others or the rest of the result view.
+            Promise.all(
+              ADVISORY_NAMES.map(async (name) => {
+                const result = await optionalJson<AdvisorySnapshot>(runId, name, token);
+                return [name, result] as const;
+              }),
+            ),
+          ]);
+        if (!active) {
+          return;
+        }
+        const next: LoadedState = { ...EMPTY_STATE };
+        if (detailResult.status === 'fulfilled') {
+          next.detail = detailResult.value;
+        } else if (isApiError(detailResult.reason)) {
+          next.detailError = detailResult.reason;
+        } else {
+          next.detailError = new ApiRequestError(0, 'network_error', 'Network request failed.');
+        }
+        if (comparison.status === 'fulfilled') {
+          next.comparison = comparison.value.value;
+          next.comparisonMissing = comparison.value.missing;
+          next.comparisonError = comparison.value.error;
+        } else {
+          next.comparisonError = describeError(comparison.reason);
+        }
+        if (manifest.status === 'fulfilled') {
+          next.manifest = manifest.value.value;
+          next.manifestMissing = manifest.value.missing;
+          next.manifestError = manifest.value.error;
+        } else {
+          next.manifestError = describeError(manifest.reason);
+        }
+        if (patch.status === 'fulfilled') {
+          next.patchText = patch.value.text;
+          next.patchMissing = patch.value.missing;
+          next.patchError = patch.value.error;
+        } else {
+          next.patchError = describeError(patch.reason);
+        }
+        if (advisoryResults.status === 'fulfilled') {
+          for (const [name, result] of advisoryResults.value) {
+            next.advisories[name] = result.error ?? result.value ?? 'missing';
+          }
+        } else {
+          for (const name of ADVISORY_NAMES) {
+            next.advisories[name] = describeError(advisoryResults.reason);
+          }
+        }
+        setState(next);
+        setLoaded(true);
+      } catch (error) {
+        // Absolute fallback: the view must never hang on "Loading run…".
+        if (!active) {
+          return;
+        }
+        setState({
+          ...EMPTY_STATE,
+          detailError: new ApiRequestError(0, 'network_error', describeError(error)),
+        });
+        setLoaded(true);
       }
-      const next: LoadedState = { ...EMPTY_STATE, advisories };
-      if (detailResult.status === 'fulfilled') {
-        next.detail = detailResult.value;
-      } else if (isApiError(detailResult.reason)) {
-        next.detailError = detailResult.reason;
-      } else {
-        next.detailError = new ApiRequestError(0, 'network_error', 'Network request failed.');
-      }
-      if (comparison.status === 'fulfilled') {
-        next.comparison = comparison.value.value;
-        next.comparisonMissing = comparison.value.missing;
-      }
-      if (manifest.status === 'fulfilled') {
-        next.manifest = manifest.value.value;
-        next.manifestMissing = manifest.value.missing;
-      }
-      if (patch.status === 'fulfilled') {
-        next.patchText = patch.value.text;
-        next.patchMissing = patch.value.missing;
-      }
-      setState(next);
-      setLoaded(true);
     })();
     return () => {
       active = false;
@@ -311,6 +371,8 @@ export function ResultView({ runId, token, onBack }: ResultViewProps) {
           <pre className="readout" tabIndex={0}>
             {state.patchText}
           </pre>
+        ) : state.patchError ? (
+          <p className="muted">patch.diff could not be loaded: {state.patchError}</p>
         ) : (
           <p className="muted">
             {state.patchMissing
@@ -377,9 +439,11 @@ export function ResultView({ runId, token, onBack }: ResultViewProps) {
             </pre>
           ) : (
             <p className="muted detail-empty">
-              {state.comparisonMissing
-                ? 'comparison.json was not produced for this run.'
-                : 'comparison.json could not be loaded.'}
+              {state.comparisonError
+                ? `comparison.json could not be loaded: ${state.comparisonError}`
+                : state.comparisonMissing
+                  ? 'comparison.json was not produced for this run.'
+                  : 'comparison.json could not be loaded.'}
             </p>
           )}
         </details>
@@ -391,9 +455,11 @@ export function ResultView({ runId, token, onBack }: ResultViewProps) {
             </pre>
           ) : (
             <p className="muted detail-empty">
-              {state.manifestMissing
-                ? 'manifest.json was not produced for this run.'
-                : 'manifest.json could not be loaded.'}
+              {state.manifestError
+                ? `manifest.json could not be loaded: ${state.manifestError}`
+                : state.manifestMissing
+                  ? 'manifest.json was not produced for this run.'
+                  : 'manifest.json could not be loaded.'}
             </p>
           )}
         </details>
@@ -552,8 +618,24 @@ function AdvisoryPanel({
 }: {
   label: string;
   version: string;
-  snapshot: AdvisorySnapshot | 'missing';
+  snapshot: AdvisorySnapshot | 'missing' | string;
 }) {
+  if (typeof snapshot === 'string' && snapshot !== 'missing') {
+    return (
+      <div className="advisory-cell">
+        <h3>
+          {label} ({version})
+        </h3>
+        <p>
+          <span className="badge state-warn">
+            <span className="lamp" aria-hidden="true" />
+            Advisory check unavailable
+          </span>
+        </p>
+        <p className="muted">Advisory data could not be loaded: {snapshot}</p>
+      </div>
+    );
+  }
   if (snapshot === 'missing' || snapshot.status === 'unavailable') {
     return (
       <div className="advisory-cell">

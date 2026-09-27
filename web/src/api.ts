@@ -119,11 +119,48 @@ export function cancelRun(runId: number, token: string): Promise<CancelResponse>
   return request<CancelResponse>(`/api/runs/${runId}/cancel`, { method: 'POST', token });
 }
 
+/**
+ * Fetch a path as binary data and return the raw Blob.
+ *
+ * Same authorization, same-origin relative path, and AbortController timeout
+ * as the JSON `request` helper, but the success path reads the body with
+ * `response.blob()` instead of JSON-parsing it. Non-2xx responses still
+ * produce the standard {"error": {"code", "message"}} ApiRequestError shape.
+ */
+async function requestBlob(path: string, token?: string | null): Promise<Blob> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const headers: Record<string, string> = { Accept: 'application/octet-stream' };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  try {
+    const response = await fetch(path, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const payload = await parseBody(response);
+      throw toApiError(response, payload);
+    }
+    return await response.blob();
+  } catch (error) {
+    if (error instanceof ApiRequestError) {
+      throw error;
+    }
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new ApiRequestError(0, 'timeout', 'Request timed out after 15 seconds.');
+    }
+    throw new ApiRequestError(0, 'network_error', 'Network request failed.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Fetch one artifact as a Blob (the backend serves it as an attachment). */
 export async function getArtifactBlob(runId: number, name: string, token: string): Promise<Blob> {
-  return request<Blob>(`/api/runs/${runId}/artifacts/${encodeURIComponent(name)}`, {
-    token,
-  });
+  return requestBlob(`/api/runs/${runId}/artifacts/${encodeURIComponent(name)}`, token);
 }
 
 /** Fetch one artifact and decode it as UTF-8 text (JSON, diff, reports). */
