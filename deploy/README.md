@@ -57,7 +57,7 @@ Record the selected model and successful smoke result. No model ID or cost is as
 
 Add the verified values to `/etc/upgrade-chamber/api.env` with a root-controlled editor. Use systemd environment-file syntax, one assignment per line: `VULTR_INFERENCE_API_KEY=...` and `VULTR_MODEL_ID=...`, alongside the required `DATABASE_PATH`, `ARTIFACT_DIR`, and `WORKER_IMAGE`. Keep the file owned by root with mode `0600`; do not place secrets in the checkout or Caddyfile.
 
-Replace `YOUR_DOMAIN.example` in [Caddyfile.example](Caddyfile.example) with the operator's domain, then install the result as `/etc/caddy/Caddyfile`. Caddy's [reverse-proxy guide](https://caddyserver.com/docs/quick-starts/reverse-proxy) explains automatic HTTPS once DNS resolves and ports 80/443 reach Caddy. Validate the file and start only after reviewing the configuration:
+Copy [Caddyfile.example](Caddyfile.example) to `/etc/caddy/Caddyfile` — it contains the live IP-based demo configuration (see the Public deployment section below for its self-signed caveat). With a real domain, change the site address and drop `tls internal` so Caddy obtains a public certificate. Caddy's [reverse-proxy guide](https://caddyserver.com/docs/quick-starts/reverse-proxy) explains automatic HTTPS once DNS resolves and ports 80/443 reach Caddy. Validate the file and start only after reviewing the configuration:
 
 ```sh
 sudo apt-get install -y caddy
@@ -71,3 +71,49 @@ curl -fsS https://YOUR_DOMAIN.example/healthz
 ```
 
 Check `systemctl status upgrade-chamber-api`, `systemctl status upgrade-chamber-worker`, and `journalctl -u upgrade-chamber-api -u upgrade-chamber-worker` on failure. The API binds to loopback and runs without Docker access; the worker runs headless and is the only service with Docker socket access. This setup has not been run on a Vultr VM yet; a live HTTPS response and inference smoke call remain deployment gates.
+
+## Public deployment
+
+The demo at `https://45.76.66.244` serves the frontend and proxies the API through Caddy on the VM. This deployment is live, with one caveat stated up front: because no public domain exists, the site uses Caddy's `tls internal` certificate authority. Browsers show a certificate warning when opening `https://45.76.66.244`; the connection is still encrypted, and visitors can inspect the self-signed certificate (issuer `Caddy Local Authority - ECC Intermediate`) and accept it. With a real domain, the `tls internal` line in the Caddyfile is removed so Caddy obtains a publicly trusted certificate automatically.
+
+### Build and upload the frontend
+
+In `web/` (Node 22): `npm install`, then `npm run build`, which produces `web/dist` (`index.html` plus hashed files under `assets/`). The build output is public static data; it ships as plain files:
+
+```sh
+tar -cf dist.tar -C web/dist .
+scp dist.tar root@45.76.66.244:/tmp/dist.tar
+# on the VM:
+mkdir -p /var/www/upgrade-chamber
+tar -xf /tmp/dist.tar -C /var/www/upgrade-chamber
+chown -R root:root /var/www/upgrade-chamber
+find /var/www/upgrade-chamber -type d -exec chmod 755 {} +
+find /var/www/upgrade-chamber -type f -exec chmod 644 {} +
+rm /tmp/dist.tar
+```
+
+### Install Caddy and configure it
+
+`apt-get install -y caddy` provides Caddy on Ubuntu 24.04 (version 2.6.2 here) with the packaged systemd unit. Copy [Caddyfile.example](Caddyfile.example) to `/etc/caddy/Caddyfile` — it must use LF line endings. Validate, then start:
+
+```sh
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+caddy fmt --overwrite /etc/caddy/Caddyfile
+systemctl enable --now caddy
+```
+
+The Caddyfile serves `/var/www/upgrade-chamber` for the SPA (`try_files {path} /index.html`) and reverse-proxies `/api/*` and `/healthz` to the API at `127.0.0.1:8000`. Security headers: `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`. Caddy's automatic HTTPS also answers plain HTTP on port 80 with a `308 Permanent Redirect` to the HTTPS address.
+
+### Firewall and verification
+
+```sh
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw status numbered
+# from an external machine:
+curl -sk https://45.76.66.244/healthz
+curl -sk https://45.76.66.244/api/profiles
+curl -sk https://45.76.66.244/
+```
+
+The API and worker systemd services are untouched by this layer; only Caddy is added and the two firewall ports are opened.

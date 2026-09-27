@@ -1,4 +1,35 @@
-YOUR_DOMAIN.example {
-    encode zstd gzip
-    reverse_proxy 127.0.0.1:8000
+# Public HTTPS configuration for the Upgrade Chamber demo deployment.
+#
+# This is the production Caddyfile served by the live VM at https://45.76.66.244.
+# Because no public domain exists for this demo, the site address is a bare IP and
+# the `tls internal` line makes Caddy issue a self-signed certificate from its own
+# local authority. Browsers will show a certificate warning; visitors must accept
+# it explicitly. That is an honest limitation of an IP-only deployment, not a
+# defect to hide.
+#
+# When a real domain is available, replace the site address `https://45.76.66.244`
+# with the domain name (for example `https://chamber.example.com`) and delete the
+# `tls internal` line. Caddy will then obtain a publicly trusted certificate
+# automatically through the ACME HTTP/DNS challenge, and the browser warning
+# disappears. Port 80 must stay reachable for the ACME challenge and the automatic
+# HTTP-to-HTTPS redirect.
+
+https://45.76.66.244 {
+	tls internal
+	encode zstd gzip
+	root * /var/www/upgrade-chamber
+	@api path /api/* /healthz
+	handle @api {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+	}
 }
