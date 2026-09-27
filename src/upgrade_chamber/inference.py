@@ -25,6 +25,60 @@ MAX_EMPTY_COMPLETION_ATTEMPTS = 3
 EMPTY_COMPLETION_BACKOFF_SECONDS = 3.0
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """Models frequently wrap JSON in prose or markdown fences; run a bounded extraction before spending the correction retry."""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    open_index = text.find("```")
+    if open_index != -1:
+        close_index = text.find("```", open_index + 3)
+        if close_index != -1:
+            inner = text[open_index + 3:close_index]
+            newline = inner.find("\n")
+            first_line = inner[:newline].strip() if newline != -1 else inner.strip()
+            if first_line and not first_line.startswith("{"):
+                inner = inner[newline + 1:] if newline != -1 else ""
+            try:
+                parsed = json.loads(inner.strip())
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            character = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+            elif character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start:index + 1])
+                    except ValueError:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+    return None
+
+
 class InferenceError(RuntimeError):
     """A provider or response failure safe to show without provider response text."""
 
@@ -162,21 +216,13 @@ class VultrInferenceClient:
             usage = data.get("usage")
             return content, usage if isinstance(usage, dict) else None
 
-    @staticmethod
-    def _parse_json_object(content: str) -> dict | None:
-        try:
-            parsed = json.loads(content)
-        except ValueError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
-
     def chat_completion_structured(
         self, messages: list[dict[str, str]], *, max_tokens: int,
         correction_prompt: str, timeout: float | None = None,
     ) -> StructuredResult:
         self._validate_prompt(messages, max_tokens)
         content, usage = self.chat_completion_raw(messages, max_tokens, timeout=timeout)
-        parsed = self._parse_json_object(content)
+        parsed = _extract_json_object(content)
         if parsed is not None:
             return StructuredResult(ok=True, content=parsed, usage=usage, attempts=1, error=None)
         retry_messages = [
@@ -186,7 +232,7 @@ class VultrInferenceClient:
         ]
         self._validate_prompt(retry_messages, max_tokens)
         retry_content, retry_usage = self.chat_completion_raw(retry_messages, max_tokens, timeout=timeout)
-        retry_parsed = self._parse_json_object(retry_content)
+        retry_parsed = _extract_json_object(retry_content)
         if retry_parsed is not None:
             return StructuredResult(ok=True, content=retry_parsed, usage=retry_usage, attempts=2, error=None)
         return StructuredResult(

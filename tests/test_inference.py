@@ -9,6 +9,7 @@ from upgrade_chamber.inference import (
     MAX_RESPONSE_BYTES,
     InferenceError,
     VultrInferenceClient,
+    _extract_json_object,
     main,
 )
 
@@ -230,6 +231,125 @@ def test_structured_non_dict_json_triggers_same_retry_path():
     assert result.attempts == 2
     assert result.content == {"status": "ok"}
     assert seen[1]["messages"][1] == {"role": "assistant", "content": '["ok"]'}
+
+
+def test_structured_fenced_json_extracts_on_first_attempt():
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '```json\n{"tool":"read_file","args":{}}\n```'}}]},
+        )
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = VultrInferenceClient(settings, client).chat_completion_structured(
+            [{"role": "user", "content": "give json"}], max_tokens=64, correction_prompt="fix it",
+        )
+    assert result.ok is True
+    assert result.attempts == 1
+    assert result.content == {"tool": "read_file", "args": {}}
+    assert result.error is None
+
+
+def test_structured_prose_wrapped_json_extracts_on_first_attempt():
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": 'Sure! Here is the JSON: {"a":1} hope that helps'}}]},
+        )
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = VultrInferenceClient(settings, client).chat_completion_structured(
+            [{"role": "user", "content": "give json"}], max_tokens=64, correction_prompt="fix it",
+        )
+    assert result.ok is True
+    assert result.attempts == 1
+    assert result.content == {"a": 1}
+
+
+def test_structured_braces_inside_strings_extract_on_first_attempt():
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": 'Here you go: {"summary":"use { and } carefully"} thanks'}}
+                ]
+            },
+        )
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = VultrInferenceClient(settings, client).chat_completion_structured(
+            [{"role": "user", "content": "give json"}], max_tokens=64, correction_prompt="fix it",
+        )
+    assert result.ok is True
+    assert result.attempts == 1
+    assert result.content == {"summary": "use { and } carefully"}
+
+
+def test_structured_plain_dict_first_attempt_unchanged():
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"status":"ok"}'}}]})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = VultrInferenceClient(settings, client).chat_completion_structured(
+            [{"role": "user", "content": "give json"}], max_tokens=64, correction_prompt="fix it",
+        )
+    assert result.ok is True
+    assert result.attempts == 1
+    assert result.content == {"status": "ok"}
+
+
+def test_structured_non_json_twice_reports_correction_retry_failure():
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "genuinely not json"}}]})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = VultrInferenceClient(settings, client).chat_completion_structured(
+            [{"role": "user", "content": "give json"}], max_tokens=64, correction_prompt="fix it",
+        )
+    assert result.ok is False
+    assert result.attempts == 2
+    assert result.error == "structured response invalid after one correction retry"
+    assert len(seen) == 2
+
+
+def test_structured_prose_wrapped_list_falls_to_retry_path():
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        if len(seen) == 1:
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "Here you go: [1,2] hope that helps"}}]},
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"status":"ok"}'}}]})
+
+    settings = Settings(vultr_inference_api_key="private-example-key", vultr_model_id="chosen-model")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = VultrInferenceClient(settings, client).chat_completion_structured(
+            [{"role": "user", "content": "give json"}], max_tokens=64, correction_prompt="fix it",
+        )
+    assert result.ok is True
+    assert result.attempts == 2
+    assert result.content == {"status": "ok"}
+    assert seen[1]["messages"][1] == {"role": "assistant", "content": "Here you go: [1,2] hope that helps"}
+
+
+def test_extract_json_object_edge_cases():
+    assert _extract_json_object("") is None
+    assert _extract_json_object('{"a": 1') is None
+    assert _extract_json_object('no braces at all') is None
+    assert _extract_json_object('{"a": 1}') == {"a": 1}
+    assert _extract_json_object('[1, 2]') is None
 
 
 def test_structured_bounds_fail_before_any_request():
