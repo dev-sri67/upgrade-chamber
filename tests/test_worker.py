@@ -14,7 +14,7 @@ from typing import Any, Callable
 from upgrade_chamber.edits import member_name
 from upgrade_chamber.runner import AttemptResult, PreparationResult
 from upgrade_chamber.storage import Store
-from upgrade_chamber.worker import Worker
+from upgrade_chamber.worker import MAX_INFERENCE_CALLS, Worker
 
 
 IMAGE = "python-runner@sha256:" + "b" * 64
@@ -505,6 +505,9 @@ class WorkerTests(unittest.TestCase):
         advisory = json.loads(self.store.get_artifact(run_id, "advisory-baseline.json"))
         self.assertEqual(advisory["status"], "available")
         self.assertEqual(queries, [("requests", "2.31.0"), ("requests", "2.32.2")])
+        # Available snapshots are cached for future runs.
+        self.assertIsNotNone(self.store.get_advisory("requests", "2.31.0"))
+        self.assertIsNotNone(self.store.get_advisory("requests", "2.32.2"))
 
         events = self.store.events_after(run_id, 0)
         self.assertEqual({event["kind"] for event in events},
@@ -583,6 +586,13 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(selection["data"]["source"], "model")
         self.assertEqual(selection["data"]["model_id"], MODEL_ID)
         self.assertNotIn("repair", {event["kind"] for event in events})
+
+    def test_default_inference_budget_is_22(self):
+        # Selection (at most 2 calls) plus two repair sessions x 10 turns.
+        self.assertEqual(MAX_INFERENCE_CALLS, 22)
+        worker = Worker(self.store, FakeRunner(preparation_result(), []),
+                        http_client=FakeInternalClient([]))
+        self.assertEqual(worker._max_inference_calls, 22)
 
     def test_model_selection_provider_failure_is_terminal(self):
         runner = FakeRunner(
@@ -927,26 +937,126 @@ class WorkerTests(unittest.TestCase):
         result_payload = json.loads(record["result"])
         self.assertEqual(result_payload["model"]["repair_count"], 2)
 
-    def test_repaired_attempt_changed_ids_fail_protected_scope(self):
+    def test_repaired_attempt_changed_ids_revert_and_retry_from_original(self):
+        # A repaired attempt that changed the collected IDs is the model's own
+        # failure: the worker reverts to the last good base (the original
+        # candidate source) and the next cycle reads it plus the real log.
         changed = ["tests/test_other.py::test_renamed"] + BASELINE_IDS[:4]
+        prepared = preparation_result(candidate=repair_candidate_tar(repair_source_zip()))
         runner = FakeRunner(
-            preparation_result(candidate=repair_candidate_tar(repair_source_zip())),
+            prepared,
             [attempt_result("baseline", installed="2.31.0"),
              failing_candidate(),
-             attempt_result("candidate", installed="2.32.2", ids=changed)])
+             failing_candidate(
+                 ids=changed, error="renamed test appeared",
+                 log=b"collected 5 items\nrenamed test appeared\n"),
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
         internal = FakeInternalClient([
             selection_response(),
-            agent_turn_response(turn_finish(
-                "adjust adapter compatibility", [adapters_edit()])),
+            agent_turn_response(turn_finish("first fix", [adapters_edit()])),
+            agent_turn_response(turn_read_file(ADAPTERS_PATH)),
+            agent_turn_response(turn_finish("second fix", [adapters_edit()])),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "completed")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(
+            phases,
+            ["preparation", "baseline", "candidate", "repair-1", "repair-2", "verifier"])
+        # Cycle-2 opening reads repair-1's real failure output...
+        cycle2_opening = internal.calls[2]["payload"]["messages"][1]["content"]
+        self.assertIn("renamed test appeared", cycle2_opening)
+        # ...and cycle-2's read_file observes the ORIGINAL source (no
+        # repaired marker), proving good_base reverted.
+        read_result = internal.calls[3]["payload"]["messages"][-1]["content"]
+        self.assertIn("UNIXSocketAdapter = object\n", read_result)
+        self.assertNotIn("# repaired", read_result)
+
+    def test_repair_breaks_collection_reverts_then_second_cycle_completes(self):
+        # Repair-1 died at collection (zero collected IDs): good_base stays
+        # the original candidate tar, cycle-2 reads that source and the
+        # broken attempt's output, then repair-2 passes and completes.
+        prepared = preparation_result(candidate=repair_candidate_tar(repair_source_zip()))
+        broken = attempt_result(
+            "candidate", status="collection_failed",
+            error="IndentationError: unexpected indent")
+        broken.artifacts["test.log"] = (
+            b"collected 0 items\nIndentationError: unexpected indent\n")
+        runner = FakeRunner(
+            prepared,
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             broken,
+             attempt_result("candidate", installed="2.32.2"),
+             attempt_result("candidate", installed="2.32.2")])
+        internal = FakeInternalClient([
+            selection_response(),
+            agent_turn_response(turn_finish("first fix", [adapters_edit()])),
+            agent_turn_response(turn_read_file(ADAPTERS_PATH)),
+            agent_turn_response(turn_finish("second fix", [adapters_edit()])),
+        ])
+        run_id = self.execute(runner, internal=internal)
+
+        record = self.store.get_run(run_id)
+        self.assertEqual(record["state"], "completed")
+        phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
+        self.assertEqual(
+            phases,
+            ["preparation", "baseline", "candidate", "repair-1", "repair-2", "verifier"])
+        self.assertEqual(
+            [call[0] for call in runner.calls],
+            ["preparation", "baseline", "candidate", "candidate", "candidate",
+             "candidate"])
+        # Cycle-2 opening carries the broken attempt's real output...
+        cycle2_opening = internal.calls[2]["payload"]["messages"][1]["content"]
+        self.assertIn("IndentationError: unexpected indent", cycle2_opening)
+        # ...and its read_file observes the original, unrepaired source.
+        read_result = internal.calls[3]["payload"]["messages"][-1]["content"]
+        self.assertIn("UNIXSocketAdapter = object\n", read_result)
+        self.assertNotIn("# repaired", read_result)
+        comparison = json.loads(self.store.get_artifact(run_id, "comparison.json"))
+        self.assertEqual(
+            [entry["attempt"] for entry in comparison["repairs"]], [1, 2])
+
+    def test_two_collection_breaking_repairs_are_honest_terminal(self):
+        # When the last cycle also breaks collection, the run terminates with
+        # a detail that names that failure honestly.
+        prepared = preparation_result(candidate=repair_candidate_tar(repair_source_zip()))
+        runner = FakeRunner(
+            prepared,
+            [attempt_result("baseline", installed="2.31.0"),
+             failing_candidate(),
+             attempt_result("candidate", status="collection_failed",
+                            error="IndentationError: unexpected indent"),
+             attempt_result("candidate", status="collection_failed",
+                            error="still unparsable")])
+        internal = FakeInternalClient([
+            selection_response(),
+            agent_turn_response(turn_finish("first fix", [adapters_edit()])),
+            agent_turn_response(turn_finish("second fix", [adapters_edit()])),
         ])
         run_id = self.execute(runner, internal=internal)
 
         record = self.store.get_run(run_id)
         self.assertEqual(record["state"], "upgrade_failed")
-        self.assertEqual(record["status_detail"], "collected test IDs changed from baseline")
+        self.assertEqual(
+            record["status_detail"],
+            "repair attempt broke test collection (collection_failed): still unparsable")
         phases = [attempt["phase"] for attempt in self.store.attempts(run_id)]
-        self.assertEqual(phases, ["preparation", "baseline", "candidate", "repair-1"])
-        self.assertEqual(len(internal.calls), 2)
+        self.assertEqual(
+            phases,
+            ["preparation", "baseline", "candidate", "repair-1", "repair-2"])
+        self.assertNotIn("verifier", phases)
+        self.assertEqual(
+            [call[0] for call in runner.calls],
+            ["preparation", "baseline", "candidate", "candidate", "candidate"])
+        events = self.store.events_after(run_id, 0)
+        repair_events = [event for event in events if event["kind"] == "repair"]
+        self.assertEqual([event["data"]["status"] for event in repair_events],
+                         ["finished", "finished"])
 
     def test_candidate_passes_directly_skips_repair_and_reuses_tar(self):
         prepared = preparation_result()
@@ -1085,6 +1195,9 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(manifest["advisories"]["target"]["status"], "unavailable")
         self.assertEqual(manifest["advisories"]["baseline"]["vulnerability_ids"], [])
         self.assertEqual(manifest["advisories"]["target"]["vulnerability_ids"], [])
+        # Unavailable snapshots must never be cached: future runs query fresh.
+        self.assertIsNone(self.store.get_advisory("requests", "2.31.0"))
+        self.assertIsNone(self.store.get_advisory("requests", "2.32.2"))
 
     def test_preparation_infrastructure_failure_is_terminal(self):
         runner = FakeRunner(

@@ -87,6 +87,15 @@ class AgentSessionTest(unittest.TestCase):
         )
         self.assertIn("read_file reports the file's current sha256", system_content)
         self.assertIn("use that exact value as original_sha256", system_content)
+        self.assertIn("COMPLETE new content of the file", system_content)
+        self.assertIn(
+            "including all imports, class definitions, and every method",
+            system_content,
+        )
+        self.assertIn(
+            "a fragment or a diff will be rejected by static validation",
+            system_content,
+        )
 
     def test_happy_repair_finishes_with_validated_edits(self):
         responses = [
@@ -168,6 +177,32 @@ class AgentSessionTest(unittest.TestCase):
         )
         self.assertIn("does not match", result.turns[0].detail)
         self.assertIn("finish rejected", captured[1][-1]["content"])
+
+    def test_finish_with_non_parsing_fragment_rejected_then_valid_finish(self):
+        # Live run 12: a fragment finish must be rejected as tool feedback
+        # inside the same session, then a complete-file finish is accepted.
+        fragment = edit_for(ADAPTERS_PATH, "    def broken(self):\n        pass\n")
+        responses = [
+            turn_response("propose_edits", {"edits": [VALID_EDIT]}),
+            turn_response("finish", {"summary": "Fragment repair.", "edits": [fragment]}),
+            turn_response("finish", {"summary": "Complete repair.", "edits": [VALID_EDIT]}),
+        ]
+        session, captured = make_session(responses)
+
+        result = session.run()
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(result.summary, "Complete repair.")
+        self.assertEqual(result.edits, [VALID_EDIT])
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(
+            [(turn.tool, turn.ok) for turn in result.turns],
+            [("propose_edits", True), ("finish", False), ("finish", True)],
+        )
+        self.assertIn("finish rejected", result.turns[1].detail)
+        self.assertIn("does not parse as Python", result.turns[1].detail)
+        # The rejection reached the model as tool feedback inside the session.
+        self.assertIn("does not parse as Python", captured[2][-1]["content"])
 
     def test_invalid_turn_shapes_end_session(self):
         cases = [

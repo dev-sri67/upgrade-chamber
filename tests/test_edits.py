@@ -156,13 +156,51 @@ class EditsTest(unittest.TestCase):
         with self.assertRaisesRegex(EditValidationError, "UTF-8"):
             validate_edits(self.zip, [edit_for(ADAPTERS_PATH, "unpaired\udcffsurrogate\n")])
 
+    # --- Python syntax gate (live run 12: bare fragment died at collection) ---
+
+    def test_accepts_complete_python_file_replacement(self):
+        complete = (
+            "import os\n"
+            "\n"
+            "class Adapter:\n"
+            "    def connect(self):\n"
+            "        return os.environ\n"
+        )
+        edits = [edit_for(ADAPTERS_PATH, complete)]
+        self.assertEqual(validate_edits(self.zip, edits), edits)
+
+    def test_rejects_bare_fragment_replacement(self):
+        # Mirror of live run 12: indented defs with no imports and no class -
+        # a bare fragment that cannot be imported standalone.
+        fragment = (
+            "    def method(self):\n"
+            "        pass\n"
+            "    def other(self):\n"
+            "        return 1\n"
+        )
+        with self.assertRaisesRegex(EditValidationError, "does not parse as Python"):
+            validate_edits(self.zip, [edit_for(ADAPTERS_PATH, fragment)])
+
+    def test_rejects_syntactically_broken_replacement(self):
+        broken = "def foo(:\n    pass\n"
+        with self.assertRaisesRegex(
+            EditValidationError, r"does not parse as Python: line 1"
+        ):
+            validate_edits(self.zip, [edit_for(ADAPTERS_PATH, broken)])
+
+    def test_setup_py_fragment_rejected_by_syntax_gate(self):
+        # Every ALLOWED_EDIT_PATHS entry ends with .py, so setup.py exercises
+        # the gate on a non-package path.
+        with self.assertRaisesRegex(EditValidationError, "does not parse as Python"):
+            validate_edits(self.zip, [edit_for("setup.py", "    setup(  # fragment\n")])
+
     def test_rejects_too_many_changed_lines(self):
         huge = "".join(f"line {index}\n" for index in range(201))
         with self.assertRaisesRegex(EditValidationError, "more than 200 lines"):
             validate_edits(self.zip, [edit_for(ADAPTERS_PATH, huge)])
 
     def test_accepts_exactly_max_changed_lines(self):
-        boundary = "".join(f"line {index}\n" for index in range(198))
+        boundary = "".join(f"x{index} = {index}\n" for index in range(198))
         edits = [edit_for(ADAPTERS_PATH, boundary)]
         self.assertEqual(validate_edits(self.zip, edits), edits)
 

@@ -8,6 +8,7 @@ inference, stdlib only.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import hashlib
 import io
@@ -139,6 +140,18 @@ def validate_edits(source_zip: bytes, edits: object) -> list[dict]:
             raise EditValidationError(
                 f"Edits change more than {MAX_CHANGED_LINES} lines in total"
             )
+        if path.endswith(".py"):
+            # Live run 12: a bare fragment replacement passed the hash and
+            # size checks but died with IndentationError during collection.
+            # Every .py replacement must parse standalone before it is
+            # accepted, so the rejection reaches the model as tool feedback.
+            try:
+                ast.parse(replacement)
+            except SyntaxError as exc:
+                location = f"line {exc.lineno}" if exc.lineno else "line unknown"
+                raise EditValidationError(
+                    f"{prefix} replacement does not parse as Python: {location}: {exc.msg}"
+                ) from None
     return list(edits)
 
 

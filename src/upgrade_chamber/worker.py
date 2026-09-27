@@ -5,7 +5,9 @@ it through the fixed phase machine while persisting every state change before
 the event that describes it. Model involvement is bounded: a single internal
 inference endpoint confirms the profile-fixed selection, and at most two
 bounded agent repair sessions may follow a failing candidate attempt, each
-one a fixed-turn tool loop executed controller-side. Evidence artifacts are
+one a fixed-turn tool loop executed controller-side in which every cycle's
+controller-run attempt feeds the next cycle's session input, all within a
+job-wide budget of 22 inference calls. Evidence artifacts are
 written before the terminal update so the manifest can hash the complete
 bundle except for itself, which is accepted as unhashable.
 """
@@ -68,7 +70,9 @@ MANIFEST_LIMITATIONS = (
     "absence of vulnerabilities."
 )
 MAX_REPAIRS = 2
-MAX_INFERENCE_CALLS = 18
+# Per-job inference budget: model selection (at most 2 calls) plus two
+# bounded repair sessions of 10 model turns each.
+MAX_INFERENCE_CALLS = 22
 INTERNAL_RESPONSE_LIMIT = 1024 * 1024
 INFERENCE_ERROR_MESSAGE_LIMIT = 500
 INFERENCE_TIMEOUT_SECONDS = 360.0  # must exceed the API-side inference call duration so the API response is never cut off client-side
@@ -333,7 +337,6 @@ class Worker:
         manifest_repairs: list[dict[str, Any]] = []
         repair_records: list[dict[str, Any]] = []
         repair_chain: list[tuple[int, bytes, bytes]] = []
-        current_tar: bytes | None = None
 
         def invoke(call: Callable[[], Any]) -> tuple[Any, str, str]:
             """Run one runner call, bracket it with timestamps, and track cleanup."""
@@ -508,11 +511,17 @@ class Worker:
             ("target", run["target_version"]),
         ):
             cached = self._store.get_advisory(run["dependency"], version)
-            if cached is not None:
+            if (
+                cached is not None
+                and cached["response"].get("status") == "available"
+            ):
                 snapshot = cached["response"]
             else:
                 snapshot = self._osv_query(run["dependency"], version)
-                self._store.put_advisory(run["dependency"], version, snapshot)
+                # An honest-but-unavailable snapshot must not poison future
+                # runs: only exactly-available snapshots are ever cached.
+                if snapshot.get("status") == "available":
+                    self._store.put_advisory(run["dependency"], version, snapshot)
             self._save_artifact(
                 run_id, f"advisory-{position}.json",
                 json.dumps(snapshot).encode("utf-8"), kind="advisory",
@@ -533,7 +542,7 @@ class Worker:
         # the bounded repairing loop; everything else stays terminal as before.
         self._transition(run_id, "upgrading")
         reached_upgrade = True
-        current_tar = candidate_tar
+        good_base = candidate_tar
         candidate, started_utc, finished_utc = invoke(
             lambda: self._runner.run_profile_attempt(
                 candidate_tar, phase="candidate",
@@ -577,7 +586,7 @@ class Worker:
                     return
                 self._transition(run_id, "repairing", attempt=repair_number)
                 try:
-                    source_zip = load_source_zip(current_tar)
+                    source_zip = load_source_zip(good_base)
                 except EditValidationError as exc:
                     finalize(
                         "upgrade_failed",
@@ -653,7 +662,7 @@ class Worker:
                 })
                 try:
                     new_zip, new_sha = edits.apply_edits(source_zip, session_result.edits)
-                    new_tar = edits.rebuild_candidate_tar(current_tar, new_zip, new_sha)
+                    new_tar = edits.rebuild_candidate_tar(good_base, new_zip, new_sha)
                 except (EditValidationError, RuntimeError, tarfile.TarError) as exc:
                     finalize(
                         "upgrade_failed",
@@ -662,11 +671,11 @@ class Worker:
                     )
                     return
                 repair_chain.append((repair_number, source_zip, new_zip))
-                current_tar = new_tar
+                attempt_base = new_tar
                 self._transition(run_id, "upgrading")
                 attempt_result, attempt_started, attempt_finished = invoke(
                     lambda: self._runner.run_profile_attempt(
-                        current_tar, phase="candidate",
+                        attempt_base, phase="candidate",
                         timeout_seconds=min(self._attempt_timeout, remaining()),
                         should_cancel=should_cancel,
                     )
@@ -682,16 +691,32 @@ class Worker:
                     attempt_result.status == "passed"
                     or attempt_result.status in FAILED_OUTCOME_STATUSES
                 )
-                if (
-                    protected and attempt_result.marker is not None
-                    and attempt_result.marker["collected_test_ids"] != baseline_ids
-                ):
-                    finalize("upgrade_failed", "collected test IDs changed from baseline")
+                ids_match = (
+                    attempt_result.marker is not None
+                    and attempt_result.marker["collected_test_ids"] == baseline_ids
+                )
+                if protected and not ids_match:
+                    # Unlike the unmodified candidate, a broken repair attempt
+                    # is the model's own failure: revert to the last good base
+                    # and let the next cycle retry from there while reading
+                    # this attempt's real failure output.
+                    latest_failure = attempt_result
+                    if repair_number < MAX_REPAIRS:
+                        continue
+                    finalize(
+                        "upgrade_failed",
+                        f"repair attempt broke test collection"
+                        f" ({attempt_result.status}): {_result_error(attempt_result)}",
+                    )
                     return
+                if ids_match:
+                    # The edit is structurally live: advance the good base so
+                    # the next cycle (and the verifier) build on it.
+                    good_base = attempt_base
                 if attempt_result.status == "passed":
                     repaired = True
                     break
-                if attempt_result.status == "test_failed":
+                if attempt_result.status in ("test_failed", "install_failed"):
                     latest_failure = attempt_result
                     continue
                 if attempt_result.status == "timed_out":
@@ -713,7 +738,7 @@ class Worker:
                 )
                 return
             if not repaired:
-                detail = f"test_failed: {_result_error(latest_failure)}"
+                detail = f"{latest_failure.status}: {_result_error(latest_failure)}"
                 if provider_note is not None:
                     note_code, note_message = provider_note
                     detail += f"; repair loop ended on provider error: {note_code}: {note_message}"
@@ -746,7 +771,7 @@ class Worker:
         self._transition(run_id, "verifying")
         verifier, started_utc, finished_utc = invoke(
             lambda: self._runner.run_profile_attempt(
-                current_tar, phase="candidate",
+                good_base, phase="candidate",
                 timeout_seconds=min(self._attempt_timeout, remaining()),
                 should_cancel=should_cancel,
             )
