@@ -7,7 +7,7 @@ inference endpoint confirms the profile-fixed selection, and at most two
 bounded agent repair sessions may follow a failing candidate attempt, each
 one a fixed-turn tool loop executed controller-side in which every cycle's
 controller-run attempt feeds the next cycle's session input, all within a
-job-wide budget of 22 inference calls. Evidence artifacts are
+job-wide budget of 26 inference calls. Evidence artifacts are
 written before the terminal update so the manifest can hash the complete
 bundle except for itself, which is accepted as unhashable.
 """
@@ -71,8 +71,8 @@ MANIFEST_LIMITATIONS = (
 )
 MAX_REPAIRS = 2
 # Per-job inference budget: model selection (at most 2 calls) plus two
-# bounded repair sessions of 10 model turns each.
-MAX_INFERENCE_CALLS = 22
+# bounded repair sessions of 12 model turns each.
+MAX_INFERENCE_CALLS = 26
 INTERNAL_RESPONSE_LIMIT = 1024 * 1024
 INFERENCE_ERROR_MESSAGE_LIMIT = 500
 INFERENCE_TIMEOUT_SECONDS = 360.0  # must exceed the API-side inference call duration so the API response is never cut off client-side

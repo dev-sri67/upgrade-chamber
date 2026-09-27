@@ -8,12 +8,13 @@ import zipfile
 from upgrade_chamber.agent import (
     MAX_MESSAGES,
     MAX_READ_FILE_CHARS,
+    MAX_TURNS,
     AgentResult,
     AgentSession,
     AgentSessionError,
     AgentTurnRecord,
 )
-from upgrade_chamber.edits import member_name
+from upgrade_chamber.edits import ROOT, member_name
 from test_edits import (
     ADAPTERS_PATH,
     TEST_FILE_PATH,
@@ -83,6 +84,11 @@ class AgentSessionTest(unittest.TestCase):
         self.assertIn("Reason briefly", system_content)
         self.assertIn(
             "the first turn should usually be list_repo_files or read_file",
+            system_content,
+        )
+        self.assertIn(
+            "Do not re-read a file you have already read; call propose_edits "
+            "or finish when your repair is ready",
             system_content,
         )
         self.assertIn("read_file reports the file's current sha256", system_content)
@@ -233,6 +239,9 @@ class AgentSessionTest(unittest.TestCase):
         self.assertFalse(result.turns[0].ok)
         self.assertIn("unknown tool", result.turns[0].detail)
 
+    def test_max_turns_constant_is_12(self):
+        self.assertEqual(MAX_TURNS, 12)
+
     def test_turn_budget_exhaustion(self):
         responses = [turn_response("list_repo_files", {}) for _ in range(3)]
         session, _ = make_session(responses, max_turns=3)
@@ -296,6 +305,24 @@ class AgentSessionTest(unittest.TestCase):
         self.assertFalse(result.turns[0].ok)
         self.assertIn("not present in source", result.turns[0].detail)
         self.assertIn("not present in source", captured[1][-1]["content"])
+        self.assertIn("repository-relative path", captured[1][-1]["content"])
+
+    def test_read_file_resolves_root_prefixed_member_path(self):
+        # Live runs 11 and 13 each burned a turn copying a ROOT-prefixed name
+        # straight from the repository listing; the tolerant retry must
+        # resolve it to the same member and return the real content.
+        session, captured = make_session([
+            turn_response("read_file", {"path": f"{ROOT}/{ADAPTERS_PATH}"}),
+            turn_response("abort", {"reason": "stop"}),
+        ])
+        result = session.run()
+
+        self.assertEqual(result.status, "aborted")
+        self.assertTrue(result.turns[0].ok)
+        self.assertEqual(result.turns[0].tool, "read_file")
+        tool_result = captured[1][-1]["content"]
+        self.assertIn("HTTPAdapter = object", tool_result)
+        self.assertIn(VALID_EDIT["original_sha256"], tool_result)
 
     def test_read_test_log_without_log_is_tool_error(self):
         responses = [

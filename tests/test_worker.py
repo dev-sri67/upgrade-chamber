@@ -587,12 +587,12 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(selection["data"]["model_id"], MODEL_ID)
         self.assertNotIn("repair", {event["kind"] for event in events})
 
-    def test_default_inference_budget_is_22(self):
-        # Selection (at most 2 calls) plus two repair sessions x 10 turns.
-        self.assertEqual(MAX_INFERENCE_CALLS, 22)
+    def test_default_inference_budget_is_26(self):
+        # Selection (at most 2 calls) plus two repair sessions x 12 turns.
+        self.assertEqual(MAX_INFERENCE_CALLS, 26)
         worker = Worker(self.store, FakeRunner(preparation_result(), []),
                         http_client=FakeInternalClient([]))
-        self.assertEqual(worker._max_inference_calls, 22)
+        self.assertEqual(worker._max_inference_calls, 26)
 
     def test_model_selection_provider_failure_is_terminal(self):
         runner = FakeRunner(
@@ -745,7 +745,7 @@ class WorkerTests(unittest.TestCase):
              failing_candidate()])
         internal = FakeInternalClient(
             [selection_response()]
-            + [agent_turn_response(turn_list_repo_files()) for _ in range(10)])
+            + [agent_turn_response(turn_list_repo_files()) for _ in range(12)])
         run_id = self.execute(runner, internal=internal)
 
         record = self.store.get_run(run_id)
@@ -755,17 +755,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(phases, ["preparation", "baseline", "candidate"])
         self.assertEqual([call[0] for call in runner.calls],
                          ["preparation", "baseline", "candidate"])
-        # Ten session turns plus selection, and nothing else: the exhausted
+        # Twelve session turns plus selection, and nothing else: the exhausted
         # session stopped on its own turn budget.
-        self.assertEqual(len(internal.calls), 11)
+        self.assertEqual(len(internal.calls), 13)
         events = self.store.events_after(run_id, 0)
         repair_events = [event for event in events if event["kind"] == "repair"]
         self.assertEqual(len(repair_events), 1)
         data = repair_events[0]["data"]
         self.assertEqual(data["status"], "exhausted")
-        self.assertEqual(data["model_calls"], 10)
+        self.assertEqual(data["model_calls"], 12)
         self.assertEqual([turn["tool"] for turn in data["turns"]],
-                         ["list_repo_files"] * 10)
+                         ["list_repo_files"] * 12)
         self.assertEqual(data["edit_paths"], [])
 
     def test_inference_budget_limits_agent_turn_posts(self):

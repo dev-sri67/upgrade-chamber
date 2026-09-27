@@ -17,13 +17,15 @@ import zipfile
 from typing import Callable
 
 from . import edits
-from .edits import ALLOWED_EDIT_PATHS, EditValidationError, member_name
+from .edits import ALLOWED_EDIT_PATHS, ROOT, EditValidationError, member_name
 
 
-# Live run 11 explored for 8 real tool turns with minimax-m3 and then had its
-# single finish proposal rejected on a stale hash; two extra turns give the
-# model room to re-read a file and re-propose without a second execution.
-MAX_TURNS = 10                    # model turns per session
+# Live run 13 spent all 10 turns without reaching finish, burning one turn
+# on a ROOT-prefixed member path copied from the listing and two turns on
+# re-reading files it had already read; tolerant path stripping and the
+# no-reread instruction absorb those slips, and the extra turns leave room
+# to re-propose after a rejection without a second execution.
+MAX_TURNS = 12                    # model turns per session
 MAX_TOOL_RESULT_CHARS = 24000     # per tool result
 MAX_READ_FILE_CHARS = 24000
 MAX_TEST_LOG_CHARS = 20000
@@ -63,7 +65,9 @@ _SYSTEM_PROMPT = (
     "Never claim tests passed; only the controller executes tests and "
     "decides outcomes. "
     "Reason briefly. Call exactly one tool per turn. Do not overthink; the "
-    "first turn should usually be list_repo_files or read_file."
+    "first turn should usually be list_repo_files or read_file. Do not "
+    "re-read a file you have already read; call propose_edits or finish "
+    "when your repair is ready."
 )
 
 
@@ -193,13 +197,30 @@ class AgentSession:
         if not isinstance(path, str):
             return "read_file requires a string path", False, "read_file requires a string path"
         name = member_name(path)
+        missing_reason = (
+            f"file not present in source: {path}"
+            " - use the repository-relative path (the part after the root "
+            "directory shown in the repository listing)"
+        )
         try:
             with zipfile.ZipFile(io.BytesIO(self.source_zip)) as archive:
                 try:
                     content = archive.read(name)
                 except KeyError:
-                    reason = f"file not present in source: {path}"
-                    return reason, False, reason
+                    # Live runs 11 and 13 each burned a turn copying a
+                    # ROOT-prefixed member name straight from the repository
+                    # listing, so the exact lookup fails; one tolerant retry
+                    # with the stripped repository-relative path absorbs it.
+                    prefix = f"{ROOT}/"
+                    if path.startswith(prefix):
+                        try:
+                            content = archive.read(member_name(path[len(prefix):]))
+                        except KeyError:
+                            reason = missing_reason
+                            return reason, False, reason
+                    else:
+                        reason = missing_reason
+                        return reason, False, reason
         except zipfile.BadZipFile as exc:
             raise AgentSessionError(
                 "source archive is not a readable zip; session cannot proceed"
