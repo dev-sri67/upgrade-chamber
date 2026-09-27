@@ -78,7 +78,7 @@ This avoids implementing a general package egress proxy during the hackathon. A 
 | Export | 20 MiB total artifacts per job; text/JSON/XML/diff only |
 | Repairs | At most two, each under the remaining job budget |
 | Patch | At most five application/dependency files and 200 changed lines |
-| Queue | One active job, at most five queued; three submissions per IP per hour initially |
+| Queue | One active job, at most five queued; ten submissions per IP per hour |
 
 These values are chosen MVP defaults, not benchmark results. Change them only after profiling and update the documented policy. The watchdog is owned by the worker and terminates the whole container. Cancelling an HTTP request is not sufficient cleanup.
 

@@ -31,7 +31,8 @@ class Settings(BaseSettings):
     worker_image: NonBlank | None = None
     worker_id: NonBlank = "upgrade-chamber-worker-1"
     max_queued_runs: int = 5
-    ip_submissions_per_hour: int = 3
+    # Raised from the initial three after live demo profiling; the queue cap and the serial worker remain the real throttles.
+    ip_submissions_per_hour: int = 10
     retention_hours: int = 24
     storage_cap_bytes: int = 1024 * 1024 * 1024
     job_deadline_seconds: float = 900.0
