@@ -43,6 +43,91 @@ Baseline must pass before any mutation. The verifier is deterministic controller
 
 Terminal outcomes and their meanings (completed, unsupported, baseline_failed, upgrade_failed, timed_out, cancelled, infrastructure_failed) are defined in the [honest-language table in mission.md](mission.md#results-and-honest-language). Cleanup is recorded as a separate status so a passing test never conceals a failed container removal.
 
+The complete flow from visitor to downloadable evidence:
+
+```mermaid
+flowchart TD
+    Start(["Visitor opens https://45.76.66.244"])
+
+    Card["Start page: validated profile card<br>repository, commit, 2.31.0 to 2.34.2<br>disclosed fixture pins, honest scope note"]
+
+    Submit["POST /api/runs<br>admission: pinned repo + commit, dependency, profile<br>limits: queue 5, 10/IP/hour, storage admission<br>run token issued once, hashed server-side"]
+
+    Queued(["queued"])
+    Preparing(["preparing"])
+    Baseline(["baseline<br>fresh container, offline install, fixed tests"])
+
+    BaselinePass["5/5 pass on requests 2.31.0"]
+    BaselineFailed(["terminal: baseline_failed"])
+
+    Selecting(["selecting"])
+
+    Upgrading(["upgrading<br>fresh container, offline install, target version"])
+
+    UpgradePassed["tests pass, collected IDs unchanged"]
+    UpgradeTestsFailed["tests fail, IDs unchanged"]
+    UpgradeIDsChanged(["terminal: upgrade_failed"])
+
+    Verifying(["verifying<br>fresh container, independent rerun"])
+
+    Repairing(["repairing<br>bounded agent session: list files, read source, read failure logs, propose edits<br>static gates: allow-list, sha256, syntax, line caps<br>at most 2 repair executions"])
+
+    RepairAccepted["accepted edit to rebuilt input<br>fresh container attempt"]
+    RepairExhausted(["terminal: upgrade_failed"])
+
+    Completed(["terminal: completed"])
+    VerifyRejected(["terminal: upgrade_failed"])
+
+    AnyStep["At any active step:<br>cancel request to cancelled<br>deadline to timed_out<br>provider failure to infrastructure_failed<br>container removal observed in every path"]
+
+    Evidence["Result page: baseline vs candidate comparison<br>repair summary, patch preview, advisory snapshots<br>no longer reported, never secure<br>limitations, artifact table with sha256s"]
+
+    Honest["Honest result page + recorded evidence<br>every terminal state renders its real status<br>downloadable patch and manifest"]
+
+    DL(["Download patch.diff, manifest, reports, logs"])
+
+    Start --> Card
+    Card -->|Start run| Submit
+    Submit --> Queued
+    Queued -->|worker leases serially| Preparing
+    Preparing -->|wheel bundles built in a networked disposable container| Baseline
+
+    Baseline --> BaselinePass
+    Baseline -->|install, collection, or test failure| BaselineFailed
+
+    BaselinePass --> Selecting
+    Selecting -->|Vultr Serverless Inference selects eligible target: minimax-m3| Upgrading
+
+    Upgrading --> UpgradePassed
+    Upgrading --> UpgradeTestsFailed
+    Upgrading --> UpgradeIDsChanged
+
+    UpgradePassed --> Verifying
+    UpgradeTestsFailed --> Repairing
+
+    Repairing --> RepairAccepted
+    RepairAccepted --> Upgrading
+    Repairing -->|no valid repair or budget spent| RepairExhausted
+
+    Verifying -->|install ok, pip check clean, IDs match, no new skips| Completed
+    Verifying -->|verifier rejects| VerifyRejected
+
+    AnyStep -.-> Queued
+
+    Completed --> Evidence
+
+    BaselineFailed -.-> Honest
+    UpgradeIDsChanged -.-> Honest
+    RepairExhausted -.-> Honest
+    VerifyRejected -.-> Honest
+    AnyStep -.-> Honest
+
+    Evidence --> DL
+    Honest --> DL
+```
+
+The services and credential separation behind these steps are drawn as an infrastructure diagram in the [Deployment and trust boundaries section of tech-stack.md](tech-stack.md#deployment-and-trust-boundaries).
+
 ## Local setup
 
 Use Python 3.11. With `uv`, install locked dependencies, run the tests, and start the API:
