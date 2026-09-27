@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from upgrade_chamber.storage import Store
+from upgrade_chamber.storage import Store, TERMINAL_STATES
 
 
 def utc_offset(seconds: float) -> str:
@@ -154,6 +154,19 @@ class StorageContractTests(unittest.TestCase):
         self.assertEqual(untouched["state"], "queued")
         self.assertIsNone(untouched["lease_expires_utc"])
         self.assertEqual(self.store.requeue_stale_leases(), [])
+
+    def test_requeue_stale_leases_ignores_every_terminal_state(self):
+        # Regression: a completed run whose lease was never cleared must not
+        # be re-marked infrastructure_failed when the stale lease expires.
+        for state in sorted(TERMINAL_STATES):
+            run_id, _ = self.create_run()
+            self.store.lease_next_run("worker-1", 60.0)
+            self.store.set_run_state(run_id, state)
+            requeued = self.store.requeue_stale_leases(now_utc=utc_offset(3600))
+            self.assertEqual(requeued, [], state)
+            run = self.store.get_run(run_id)
+            self.assertEqual(run["state"], state)
+            self.assertEqual(run["status_detail"], None)
 
     def test_set_run_state_updates_state_detail_and_updated_utc(self):
         run_id, _ = self.create_run()

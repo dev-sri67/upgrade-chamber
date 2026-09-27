@@ -14,10 +14,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-# Terminal alternatives from the fixed state machine in tech-stack.md. A run in
+# Every terminal state from the fixed state machine in tech-stack.md: the
+# happy-path outcome (completed) plus the terminal alternatives. A run in
 # one of these states (or with terminal_utc set) accepts no further leases,
-# cancel requests, or stale-lease requeues.
+# cancel requests, or stale-lease requeues. Omitting completed here let
+# requeue_stale_leases re-mark genuinely finished runs whose leases were
+# never cleared, turning successful outcomes into infrastructure failures.
 TERMINAL_STATES = frozenset({
+    "completed",
     "unsupported",
     "baseline_failed",
     "upgrade_failed",
