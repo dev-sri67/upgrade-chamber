@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!--
+    Authored mark: chamber controller faceplate with three status lamps.
+    Provenance: hand-authored SVG for this build (no generated raster involved).
+  -->
+  <rect x="1" y="1" width="30" height="30" rx="6" fill="#dedfd9" stroke="#9b9f98" stroke-width="1.5"/>
+  <rect x="5" y="5" width="22" height="6" rx="2" fill="#eef0e6" stroke="#c2c6ba" stroke-width="1"/>
+  <rect x="7" y="7" width="12" height="2" rx="1" fill="#4d5358"/>
+  <circle cx="9" cy="20" r="3" fill="#1f7a37"/>
+  <circle cx="16" cy="20" r="3" fill="#b97700"/>
+  <circle cx="23" cy="20" r="3" fill="#bf3333"/>
+  <rect x="6" y="26" width="20" height="1.5" rx="0.75" fill="#a8aba5"/>
+</svg>
