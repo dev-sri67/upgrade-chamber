@@ -1,9 +1,13 @@
 """Tests for the bounded tool-loop agent session."""
 
+import hashlib
+import io
 import unittest
+import zipfile
 
 from upgrade_chamber.agent import (
     MAX_MESSAGES,
+    MAX_READ_FILE_CHARS,
     AgentResult,
     AgentSession,
     AgentSessionError,
@@ -32,7 +36,7 @@ NOTE_TEXT = (
 
 
 def make_session(responses, *, test_log=SAMPLE_LOG, usages=None,
-                 max_turns=8, max_messages=MAX_MESSAGES):
+                 max_turns=10, max_messages=MAX_MESSAGES, source_zip_bytes=None):
     """Build a session whose model_call pops scripted responses per call."""
     captured: list[list[dict]] = []
     state = {"index": 0}
@@ -50,7 +54,7 @@ def make_session(responses, *, test_log=SAMPLE_LOG, usages=None,
         return payload
 
     session = AgentSession(
-        source_zip=source_zip(),
+        source_zip=source_zip_bytes if source_zip_bytes is not None else source_zip(),
         test_log=test_log,
         model_call=model_call,
         max_turns=max_turns,
@@ -81,6 +85,8 @@ class AgentSessionTest(unittest.TestCase):
             "the first turn should usually be list_repo_files or read_file",
             system_content,
         )
+        self.assertIn("read_file reports the file's current sha256", system_content)
+        self.assertIn("use that exact value as original_sha256", system_content)
 
     def test_happy_repair_finishes_with_validated_edits(self):
         responses = [
@@ -202,6 +208,47 @@ class AgentSessionTest(unittest.TestCase):
         self.assertEqual(result.model_calls, 3)
         self.assertEqual(len(result.turns), 3)
         self.assertTrue(all(turn.ok for turn in result.turns))
+
+    def test_read_file_appends_exact_sha256_line(self):
+        responses = [
+            turn_response("read_file", {"path": ADAPTERS_PATH}),
+            turn_response("abort", {"reason": "stop"}),
+        ]
+        session, captured = make_session(responses)
+        session.run()
+        tool_result = captured[1][-1]["content"]
+        # The final line must carry the exact hash the edit validator expects.
+        expected_line = (
+            f"[file sha256: {VALID_EDIT['original_sha256']}]"
+            " - use this exact value as original_sha256 when proposing an edit to this file"
+        )
+        self.assertEqual(tool_result.splitlines()[-1], expected_line)
+        self.assertIn("HTTPAdapter = object", tool_result)
+
+    def test_read_file_reports_full_content_sha256_even_when_truncated(self):
+        # Live run 11's proposal was rejected because the model could not see
+        # any hash; the appended line must survive truncation and carry the
+        # hash of the FULL content, not the delivered prefix.
+        large_bytes = ("a" * (MAX_READ_FILE_CHARS + 1000) + "\n").encode("utf-8")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                zipfile.ZipInfo(member_name(ADAPTERS_PATH), date_time=(1980, 1, 1, 0, 0, 0)),
+                large_bytes,
+            )
+        responses = [
+            turn_response("read_file", {"path": ADAPTERS_PATH}),
+            turn_response("abort", {"reason": "stop"}),
+        ]
+        session, captured = make_session(responses, source_zip_bytes=output.getvalue())
+        session.run()
+        tool_result = captured[1][-1]["content"]
+        self.assertIn("[truncated]", tool_result)
+        expected_line = (
+            f"[file sha256: {hashlib.sha256(large_bytes).hexdigest()}]"
+            " - use this exact value as original_sha256 when proposing an edit to this file"
+        )
+        self.assertEqual(tool_result.splitlines()[-1], expected_line)
 
     def test_read_file_missing_member_continues_to_abort(self):
         responses = [

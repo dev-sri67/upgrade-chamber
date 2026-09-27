@@ -10,6 +10,7 @@ only. No I/O, no inference, stdlib only.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import json
 import zipfile
@@ -19,7 +20,10 @@ from . import edits
 from .edits import ALLOWED_EDIT_PATHS, EditValidationError, member_name
 
 
-MAX_TURNS = 8                     # model turns per session
+# Live run 11 explored for 8 real tool turns with minimax-m3 and then had its
+# single finish proposal rejected on a stale hash; two extra turns give the
+# model room to re-read a file and re-propose without a second execution.
+MAX_TURNS = 10                    # model turns per session
 MAX_TOOL_RESULT_CHARS = 24000     # per tool result
 MAX_READ_FILE_CHARS = 24000
 MAX_TEST_LOG_CHARS = 20000
@@ -50,6 +54,8 @@ _SYSTEM_PROMPT = (
     "Each edit entry must be a dict with exactly path, original_sha256, and "
     "replacement_text, where path comes from the controller-provided "
     "editable allow-list and original_sha256 matches the current content. "
+    "read_file reports the file's current sha256; use that exact value as "
+    "original_sha256 when editing that file. "
     "Never claim tests passed; only the controller executes tests and "
     "decides outcomes. "
     "Reason briefly. Call exactly one tool per turn. Do not overthink; the "
@@ -195,8 +201,19 @@ class AgentSession:
                 "source archive is not a readable zip; session cannot proceed"
             ) from exc
         text = content.decode("utf-8", errors="replace")
+        # Live run 11's finish proposal was rejected solely because
+        # original_sha256 did not match: read_file showed only content, so the
+        # model had to guess the hash. The digest is computed from the full
+        # member bytes before truncation so the model can copy an exact value.
+        result = (
+            _cap_head(text, MAX_READ_FILE_CHARS)
+            + "\n"
+            + "[file sha256: "
+            + hashlib.sha256(content).hexdigest()
+            + "] - use this exact value as original_sha256 when proposing an edit to this file"
+        )
         return (
-            _cap_head(text, MAX_READ_FILE_CHARS),
+            result,
             True,
             f"read {path} ({len(text)} chars)",
         )

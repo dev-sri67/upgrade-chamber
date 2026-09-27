@@ -63,6 +63,33 @@ def test_zero_vulnerabilities_is_available_with_empty_list():
     assert snapshot["vulnerabilities"] == []
 
 
+def test_empty_object_body_is_available_with_zero_vulnerabilities():
+    # Live probing showed OSV answering HTTP 200 with `{}` when an exact
+    # version (requests 2.34.2) has zero known vulnerabilities; that is the
+    # honest reading of the contract, not an unexpected shape.
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    with offline_client(respond) as client:
+        snapshot = query_osv(PACKAGE, VERSION, client=client, now_utc=FETCHED)
+
+    assert_snapshot_common(snapshot, "available")
+    assert snapshot["vulnerabilities"] == []
+    assert "error" not in snapshot
+
+
+def test_body_without_vulns_key_is_available_with_zero_vulnerabilities():
+    # Any 200 body lacking a "vulns" key parses as an honest empty result.
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"query_time": 0.01})
+
+    with offline_client(respond) as client:
+        snapshot = query_osv(PACKAGE, VERSION, client=client, now_utc=FETCHED)
+
+    assert_snapshot_common(snapshot, "available")
+    assert snapshot["vulnerabilities"] == []
+
+
 def test_http_error_status_records_unavailable_without_provider_body():
     def reject(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="diagnostic provider body")

@@ -62,7 +62,13 @@ def _requested_vulnerabilities(chosen: httpx.Client, payload: dict[str, Any]) ->
         raise OSVError("OSV returned invalid JSON") from None
     if not isinstance(data, dict):
         raise OSVError("OSV response has an unexpected shape")
-    vulnerabilities = data.get("vulns")
+    # Live probing of requests 2.34.2 showed OSV answering HTTP 200 with an
+    # empty object when there are zero known vulnerabilities; treating that
+    # as an error recorded a dishonest "unavailable". A body without a
+    # "vulns" key is an honest empty result.
+    if "vulns" not in data:
+        return []
+    vulnerabilities = data["vulns"]
     if not isinstance(vulnerabilities, list):
         raise OSVError("OSV response has an unexpected shape")
     # Malformed entries are skipped; a snapshot never invents a vulnerability.

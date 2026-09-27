@@ -735,7 +735,7 @@ class WorkerTests(unittest.TestCase):
              failing_candidate()])
         internal = FakeInternalClient(
             [selection_response()]
-            + [agent_turn_response(turn_list_repo_files()) for _ in range(8)])
+            + [agent_turn_response(turn_list_repo_files()) for _ in range(10)])
         run_id = self.execute(runner, internal=internal)
 
         record = self.store.get_run(run_id)
@@ -745,17 +745,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(phases, ["preparation", "baseline", "candidate"])
         self.assertEqual([call[0] for call in runner.calls],
                          ["preparation", "baseline", "candidate"])
-        # Eight session turns plus selection, and nothing else: the exhausted
+        # Ten session turns plus selection, and nothing else: the exhausted
         # session stopped on its own turn budget.
-        self.assertEqual(len(internal.calls), 9)
+        self.assertEqual(len(internal.calls), 11)
         events = self.store.events_after(run_id, 0)
         repair_events = [event for event in events if event["kind"] == "repair"]
         self.assertEqual(len(repair_events), 1)
         data = repair_events[0]["data"]
         self.assertEqual(data["status"], "exhausted")
-        self.assertEqual(data["model_calls"], 8)
+        self.assertEqual(data["model_calls"], 10)
         self.assertEqual([turn["tool"] for turn in data["turns"]],
-                         ["list_repo_files"] * 8)
+                         ["list_repo_files"] * 10)
         self.assertEqual(data["edit_paths"], [])
 
     def test_inference_budget_limits_agent_turn_posts(self):
