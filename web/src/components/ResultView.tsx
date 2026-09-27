@@ -306,6 +306,9 @@ export function ResultView({ runId, token, onBack }: ResultViewProps) {
 
   const artifacts: ArtifactRecord[] = detail.artifacts;
   const patchArtifact = artifacts.find((artifact) => artifact.name === PATCH_NAME) ?? null;
+  // The backend manifest ships `limitations` either as prose text or as a list;
+  // normalize before rendering so neither shape can crash the result view.
+  const limitations = state.manifest?.limitations;
 
   return (
     <main className="view">
@@ -467,9 +470,11 @@ export function ResultView({ runId, token, onBack }: ResultViewProps) {
 
       <Section title="Limitations">
         <div className="panel">
-          {state.manifest?.limitations?.length ? (
+          {typeof limitations === 'string' && limitations.trim() ? (
+            <p className="limitation-list">{limitations}</p>
+          ) : Array.isArray(limitations) && limitations.length > 0 ? (
             <ul className="limitation-list">
-              {state.manifest.limitations.map((limitation, index) => (
+              {limitations.map((limitation, index) => (
                 <li key={index}>{limitation}</li>
               ))}
             </ul>

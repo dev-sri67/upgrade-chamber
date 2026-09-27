@@ -218,7 +218,8 @@ export interface ManifestArtifact {
   };
   result: { state: string; detail: string | null };
   cleanup_state: string;
-  limitations: string[];
+  /** Backend ships either a prose string or a list of strings depending on run output. */
+  limitations: string | string[];
   artifacts: Record<string, { sha256: string; bytes: number }>;
 }
 
