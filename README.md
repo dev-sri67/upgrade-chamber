@@ -2,6 +2,23 @@
 
 Upgrade Chamber is a live demonstration of one Python dependency upgrade, tested against a repository's own test suite, repaired by a bounded agent when the upgrade breaks it, and reported with a downloadable patch and inspectable evidence. The product specification is in [mission.md](mission.md), with [technical design](tech-stack.md) and [delivery gates](roadmap.md).
 
+At a high level, a run moves through this flow:
+
+```mermaid
+flowchart TD
+    A([A maintainer submits a validated upgrade<br>from the start page]) --> B["1 — Baseline: the repository's tests<br>run offline in a disposable container<br>on the current version"]
+    B --> C["2 — Upgrade attempt: the same tests<br>run in a fresh container<br>on the target version"]
+    C -->|tests pass| V["3 — Verification: another fresh container<br>re-runs the accepted result independently"]
+    C -->|tests fail| R["4 — Repair: a Vultr-hosted AI agent reads the<br>failure and proposes a small code fix.<br>Tests are never editable; every edit is checked"]
+    R -->|fixed code, fresh container| C
+    R -.->|no valid repair| H[["honest failure: recorded verbatim,<br>never shown as success"]]
+    C -.->|broken tests or changed scope| H
+    V --> D([Download the patch and the full evidence bundle:<br>test reports, logs, installed versions,<br>advisory snapshots, manifest with hashes])
+    H --> D
+```
+
+Newcomers who want the full detail — admission limits, agent bounds, and every terminal state — should continue to the [The run lifecycle](#the-run-lifecycle) section and its detailed diagram.
+
 Product promise: **A dependency upgrade, tested against your repository, with the patch and evidence to review.**
 
 The product is live at **https://45.76.66.244** on a Vultr VM behind Caddy. One note before the demo: because no public domain is configured, the site uses a self-signed certificate (Caddy's `tls internal` authority). Browsers show a certificate warning before the page loads; the connection is still encrypted, and accepting the warning is expected for this demo. With a real domain, changing the Caddy site address gives an automatic publicly trusted certificate — [deploy/Caddyfile.example](deploy/Caddyfile.example) documents that migration.
